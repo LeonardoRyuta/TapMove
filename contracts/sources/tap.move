@@ -10,6 +10,7 @@ module tap_market::tap_market {
     use pyth::price::Price;
     use pyth::price_identifier;
     use pyth::price; // helpers like price::get_price, price::get_expo, price::get_timestamp
+    use pyth::i64;
 
     /***************
      *  ERRORS
@@ -133,7 +134,7 @@ module tap_market::tap_market {
         // 1) Price-distance component (vertical axis)
         //    distance in rows from the middle bucket
         let price_distance =
-            if bucket > mid { bucket - mid } else { mid - bucket };
+            if (bucket > mid) { bucket - mid } else { mid - bucket };
 
         // 2) Time-distance component (horizontal axis)
         //    how many buckets into the future this bet settles
@@ -147,22 +148,22 @@ module tap_market::tap_market {
 
         // Time bonus only for being further than the minimum required distance.
         // This is what makes further-out columns pay more, and nearer ones pay less.
-        let time_bonus_bps = if (time_distance > min_time_distance) 
-        {
-                (time_distance - min_time_distance) * TIME_STEP_BPS
-            } else {
-                0
-            };
+        let time_bonus_bps = if (time_distance > min_time_distance) {
+            (time_distance - min_time_distance) * TIME_STEP_BPS
+        } else {
+            0
+        };
 
         // 3) Combine components
-        let mut mult_bps = BASE_MULT_BPS + price_distance * DISTANCE_STEP_BPS + time_bonus_bps;
+        let raw_mult_bps = BASE_MULT_BPS + price_distance * DISTANCE_STEP_BPS + time_bonus_bps;
 
         // 4) Clamp to sensible range [1.0x, MAX_MULT_BPS]
-        if (mult_bps < 10_000) {
-            mult_bps = 10_000;
-        };
-        if (mult_bps > MAX_MULT_BPS) {
-            mult_bps = MAX_MULT_BPS;
+        let mult_bps = if (raw_mult_bps < 10_000) {
+            10_000
+        } else if (raw_mult_bps > MAX_MULT_BPS) {
+            MAX_MULT_BPS
+        } else {
+            raw_mult_bps
         };
 
         mult_bps
@@ -399,7 +400,7 @@ module tap_market::tap_market {
         pyth::update_price_feeds(pyth_price_update, fee_coins);
 
         // 2) Read price from our configured feed
-        let price_id = price_identifier::from_byte_vec(copy market.price_feed_id);
+        let price_id = price_identifier::from_byte_vec(market.price_feed_id);
         let price_struct: Price = pyth::get_price(price_id);
 
         // 3) Map price to price bucket
