@@ -9,8 +9,8 @@ module tap_market::tap_market {
     use pyth::pyth;
     use pyth::price::Price;
     use pyth::price_identifier;
-    use pyth::price; // helpers like price::get_price, price::get_expo, price::get_timestamp
-    use pyth::i64;
+    use pyth::price;
+    use pyth::i64::I64;
 
     /***************
      *  ERRORS
@@ -34,13 +34,11 @@ module tap_market::tap_market {
      *  DATA
      ***************/
 
-    // Multiplier tuning
-    // All values in basis points (1x = 10_000)
-    const BASE_MULT_BPS: u64        = 10500;  // 1.05x at center, earliest expiry
-    const DISTANCE_STEP_BPS: u64    = 600;    // +0.06x per price bucket from center
-    const TIME_STEP_BPS: u64        = 800;    // +0.08x per extra time bucket beyond minimum
-    const MAX_MULT_BPS: u64         = 100000; // cap at 10x
-
+    // Multiplier tuning (1x = 10_000 bps)
+    const BASE_MULT_BPS: u64     = 10_500;  // 1.05x at center, earliest expiry
+    const DISTANCE_STEP_BPS: u64 = 600;     // +0.06x per price bucket from center
+    const TIME_STEP_BPS: u64     = 800;     // +0.08x per extra time bucket beyond minimum
+    const MAX_MULT_BPS: u64      = 100_000; // cap at 10x
 
     /// Single bet: player picks a price bucket and an expiry time bucket.
     struct Bet has store {
@@ -53,7 +51,8 @@ module tap_market::tap_market {
         won: bool,
     }
 
-    // Global market parameters and house liquidity.
+    /// Global market parameters and house liquidity.
+    /// One Market<CoinType> is stored under the admin's address.
     struct Market<phantom CoinType> has key {
         admin: address,
 
@@ -82,8 +81,8 @@ module tap_market::tap_market {
         // Linear mapping from price -> bucket
         // anchor_price is the Pyth price that corresponds to mid_price_bucket
         // bucket_size is the price delta between adjacent buckets.
-        anchor_price: i64,
-        bucket_size: i64,
+        anchor_price: I64,
+        bucket_size: I64,
 
         // Pyth price feed ID for the asset (without 0x prefix, as bytes)
         price_feed_id: vector<u8>,
@@ -102,21 +101,11 @@ module tap_market::tap_market {
         assert!(addr == market.admin, error::invalid_argument(E_NOT_ADMIN));
     }
 
-    fun get_market_mut<CoinType>(addr: address): &mut Market<CoinType> {
-        assert!(exists<Market<CoinType>>(addr), error::not_found(E_NO_MARKET));
-        borrow_global_mut<Market<CoinType>>(addr)
-    }
-
-    fun get_market<CoinType>(addr: address): &Market<CoinType> {
-        assert!(exists<Market<CoinType>>(addr), error::not_found(E_NO_MARKET));
-        borrow_global<Market<CoinType>>(addr)
-    }
-
     fun current_time_bucket<CoinType>(market: &Market<CoinType>): u64 {
         timestamp::now_seconds() / market.time_bucket_seconds
     }
 
-    // Multiplier curve:
+    /// Multiplier curve:
     /// - Higher for buckets further from the mid price (riskier)
     /// - Higher for bets further in the future (harder to predict),
     ///   which means that for a *fixed* expiry bucket, the multiplier
@@ -132,22 +121,16 @@ module tap_market::tap_market {
         let bucket = price_bucket as u64;
 
         // 1) Price-distance component (vertical axis)
-        //    distance in rows from the middle bucket
         let price_distance =
             if (bucket > mid) { bucket - mid } else { mid - bucket };
 
         // 2) Time-distance component (horizontal axis)
-        //    how many buckets into the future this bet settles
         let time_distance = expiry_bucket - current_bucket;
 
         // Earliest *allowed* offset:
-        // - place_bet enforces:
-        //   earliest_allowed_bucket = current_bucket + locked_columns_ahead + 1
-        //   so minimum time_distance = locked_columns_ahead + 1
         let min_time_distance = market.locked_columns_ahead + 1;
 
         // Time bonus only for being further than the minimum required distance.
-        // This is what makes further-out columns pay more, and nearer ones pay less.
         let time_bonus_bps = if (time_distance > min_time_distance) {
             (time_distance - min_time_distance) * TIME_STEP_BPS
         } else {
@@ -155,7 +138,9 @@ module tap_market::tap_market {
         };
 
         // 3) Combine components
-        let raw_mult_bps = BASE_MULT_BPS + price_distance * DISTANCE_STEP_BPS + time_bonus_bps;
+        let raw_mult_bps = BASE_MULT_BPS
+            + price_distance * DISTANCE_STEP_BPS
+            + time_bonus_bps;
 
         // 4) Clamp to sensible range [1.0x, MAX_MULT_BPS]
         let mult_bps = if (raw_mult_bps < 10_000) {
@@ -169,34 +154,48 @@ module tap_market::tap_market {
         mult_bps
     }
 
-
     /// Map a Pyth price into a bucket index using a linear mapping.
     /// - anchor_price is price at the mid bucket
     /// - bucket_size is price step per bucket
     /// Buckets are clamped to [0, num_price_buckets-1].
-    fun map_price_to_bucket<CoinType>(
-        market: &Market<CoinType>,
+    fun map_price_to_bucket(
+        num_price_buckets: u8,
+        mid_price_bucket: u8,
+        anchor_price: &I64,
+        bucket_size: &I64,
         p: &Price,
     ): u8 {
-        let price_i64 = price::get_price(p); // signed integer price
-        let diff = price_i64 - market.anchor_price;
+        let price_i64 = price::get_price(p);
 
-        // integer division toward zero
-        let steps = diff / market.bucket_size; // i64
-        let mid_i64 = (market.mid_price_bucket as i64);
-        let idx_i64 = mid_i64 + steps;
+        // For now, clamp any negative price to the lowest bucket.
+        let price_val = if (pyth::i64::get_is_negative(&price_i64)) {
+            0
+        } else {
+            pyth::i64::get_magnitude_if_positive(&price_i64)
+        };
 
-        let zero: i64 = 0;
-        let max_i64 = (market.num_price_buckets as i64) - 1;
+        let anchor_val = if (pyth::i64::get_is_negative(anchor_price)) {
+            0
+        } else {
+            pyth::i64::get_magnitude_if_positive(anchor_price)
+        };
 
-        let clamped =
-            if (idx_i64 < zero) {
-                zero
-            } else if (idx_i64 > max_i64) {
-                max_i64
-            } else {
-                idx_i64
-            };
+        let bucket_val = pyth::i64::get_magnitude_if_positive(bucket_size);
+
+        let mid = mid_price_bucket as u64;
+
+        let idx = if (price_val >= anchor_val) {
+            let diff = price_val - anchor_val;
+            let steps = diff / bucket_val;
+            mid + steps
+        } else {
+            let diff = anchor_val - price_val;
+            let steps = diff / bucket_val;
+            if (steps > mid) { 0 } else { mid - steps }
+        };
+
+        let max_bucket = (num_price_buckets as u64) - 1;
+        let clamped = if (idx > max_bucket) { max_bucket } else { idx };
 
         clamped as u8
     }
@@ -226,7 +225,6 @@ module tap_market::tap_market {
             return;
         };
         let c_ref = table::borrow_mut(&mut market.user_open_bets, user);
-        // we don't let this go negative; if it hits 0 we can leave it as 0.
         if (*c_ref > 0) {
             *c_ref = *c_ref - 1;
         }
@@ -240,6 +238,8 @@ module tap_market::tap_market {
     ///
     /// - price_feed_id: Pyth price feed ID bytes (no 0x prefix) for the asset
     /// - anchor_price / bucket_size: encoded in same units as price::get_price()
+    ///   These are passed as (magnitude, is_negative) for I64
+    /// - initial_house_liquidity_amount: amount to deposit from admin's account
     public entry fun init_market<CoinType>(
         admin: &signer,
         num_price_buckets: u8,
@@ -250,20 +250,42 @@ module tap_market::tap_market {
         min_bet_size: u64,
         max_bet_size: u64,
         max_open_bets_per_user: u64,
-        anchor_price: i64,
-        bucket_size: i64,
+        anchor_price_magnitude: u64,
+        anchor_price_negative: bool,
+        bucket_size_magnitude: u64,
+        bucket_size_negative: bool,
         price_feed_id: vector<u8>,
-        initial_house_liquidity: coin::Coin<CoinType>,
-    ) acquires Market {
-
+        initial_house_liquidity_amount: u64,
+    ) {
         let admin_addr = signer::address_of(admin);
-        assert!(!exists<Market<CoinType>>(admin_addr), error::already_exists(E_MARKET_ALREADY_INIT));
+        assert!(
+            !exists<Market<CoinType>>(admin_addr),
+            error::already_exists(E_MARKET_ALREADY_INIT)
+        );
+
+        // Construct I64 values from parameters
+        let anchor_price = pyth::i64::new(anchor_price_magnitude, anchor_price_negative);
+        let bucket_size = pyth::i64::new(bucket_size_magnitude, bucket_size_negative);
+
+        // Withdraw initial liquidity from admin's account
+        let initial_house_liquidity = coin::withdraw<CoinType>(admin, initial_house_liquidity_amount);
 
         assert!(num_price_buckets > 0, error::invalid_argument(E_INVALID_ARGUMENT));
-        assert!((mid_price_bucket as u64) < (num_price_buckets as u64), error::invalid_argument(E_INVALID_PRICE_BUCKET));
+        assert!(
+            (mid_price_bucket as u64) < (num_price_buckets as u64),
+            error::invalid_argument(E_INVALID_PRICE_BUCKET)
+        );
         assert!(time_bucket_seconds > 0, error::invalid_argument(E_INVALID_ARGUMENT));
-        assert!(min_bet_size > 0 && min_bet_size <= max_bet_size, error::invalid_argument(E_INVALID_ARGUMENT));
-        assert!(bucket_size > 0, error::invalid_argument(E_INVALID_ARGUMENT));
+        assert!(
+            min_bet_size > 0 && min_bet_size <= max_bet_size,
+            error::invalid_argument(E_INVALID_ARGUMENT)
+        );
+        // bucket_size should be positive
+        assert!(
+            !pyth::i64::get_is_negative(&bucket_size)
+                && pyth::i64::get_magnitude_if_positive(&bucket_size) > 0,
+            error::invalid_argument(E_INVALID_ARGUMENT)
+        );
 
         move_to(
             admin,
@@ -294,25 +316,34 @@ module tap_market::tap_market {
 
     /// User places a bet into a specific price bucket at a future time bucket.
     ///
-    /// - expiry_timestamp_secs will be discretized into a time bucket.
+    /// - `market_admin` is the address where Market<CoinType> is stored
+    /// - `expiry_timestamp_secs` will be discretized into a time bucket.
     /// - Locked-column rule: user may *not* bet on current bucket or the next
     ///   `locked_columns_ahead` buckets (e.g. locked_columns_ahead = 1 means
     ///   "cannot bet on current or current+1").
     public entry fun place_bet<CoinType>(
         user: &signer,
-        stake: coin::Coin<CoinType>,
+        market_admin: address,
+        stake_amount: u64,
         price_bucket: u8,
         expiry_timestamp_secs: u64,
     ) acquires Market {
         let user_addr = signer::address_of(user);
-        let market = get_market_mut<CoinType>(user_addr);
+
+        assert!(exists<Market<CoinType>>(market_admin), error::not_found(E_NO_MARKET));
+        let market = borrow_global_mut<Market<CoinType>>(market_admin);
 
         // basic validation
-        assert!((price_bucket as u64) < (market.num_price_buckets as u64), error::invalid_argument(E_INVALID_PRICE_BUCKET));
+        assert!(
+            (price_bucket as u64) < (market.num_price_buckets as u64),
+            error::invalid_argument(E_INVALID_PRICE_BUCKET)
+        );
 
-        let amount = coin::value(&stake);
-        assert!(amount >= market.min_bet_size, error::invalid_argument(E_BET_TOO_SMALL));
-        assert!(amount <= market.max_bet_size, error::invalid_argument(E_BET_TOO_LARGE));
+        assert!(stake_amount >= market.min_bet_size, error::invalid_argument(E_BET_TOO_SMALL));
+        assert!(stake_amount <= market.max_bet_size, error::invalid_argument(E_BET_TOO_LARGE));
+
+        // Withdraw stake from user's account
+        let stake = coin::withdraw<CoinType>(user, stake_amount);
 
         let current_bucket = current_time_bucket(market);
         let expiry_bucket = expiry_timestamp_secs / market.time_bucket_seconds;
@@ -351,7 +382,7 @@ module tap_market::tap_market {
             bet_id,
             Bet {
                 user: user_addr,
-                stake: amount,
+                stake: stake_amount,
                 multiplier_bps,
                 price_bucket,
                 expiry_bucket,
@@ -366,33 +397,31 @@ module tap_market::tap_market {
      ***************/
 
     /// Settle a single bet:
-    /// - only admin can call
+    /// - only admin can call (the account that holds Market<CoinType>)
     /// - must pass `pyth_price_update` from Hermes
     /// - contract pays the update fee from admin’s account
     /// - reads the Pyth price and maps it to a price bucket
     /// - if bucket matches bet.price_bucket, user wins
-    ///
-    /// NOTE:
-    ///  - For now, this uses the Pyth price at *settlement time*.
-    ///  - For a hackathon MVP you can just make your backend call this
-    ///    right at (or just after) the bet’s expiry bucket to approximate
-    ///    “price at expiry”.
     public entry fun settle_bet<CoinType>(
         admin: &signer,
         bet_id: u64,
         pyth_price_update: vector<vector<u8>>,
     ) acquires Market {
         let admin_addr = signer::address_of(admin);
-        let market = get_market_mut<CoinType>(admin_addr);
+        assert!(exists<Market<CoinType>>(admin_addr), error::not_found(E_NO_MARKET));
+        let market = borrow_global_mut<Market<CoinType>>(admin_addr);
         assert_admin(market, admin_addr);
 
+        // ensure bet exists
         assert!(table::contains(&market.bets, bet_id), error::not_found(E_INVALID_BET_ID));
-        let bet_ref = table::borrow_mut(&mut market.bets, bet_id);
-        assert!(!bet_ref.settled, error::invalid_argument(E_BET_ALREADY_SETTLED));
 
-        // cannot settle before expiry bucket
-        let now_bucket = current_time_bucket(market);
-        assert!(now_bucket >= bet_ref.expiry_bucket, error::invalid_argument(E_EXPIRY_TOO_SOON));
+        // copy some config locally
+        let time_bucket_seconds = market.time_bucket_seconds;
+        let num_price_buckets = market.num_price_buckets;
+        let mid_price_bucket = market.mid_price_bucket;
+        let anchor_price_ref = &market.anchor_price;
+        let bucket_size_ref = &market.bucket_size;
+        let price_feed_id = market.price_feed_id;
 
         // 1) Pay Pyth update fee and update price feeds
         let fee = pyth::get_update_fee(&pyth_price_update);
@@ -400,28 +429,81 @@ module tap_market::tap_market {
         pyth::update_price_feeds(pyth_price_update, fee_coins);
 
         // 2) Read price from our configured feed
-        let price_id = price_identifier::from_byte_vec(market.price_feed_id);
+        let price_id = price_identifier::from_byte_vec(price_feed_id);
         let price_struct: Price = pyth::get_price(price_id);
 
-        // 3) Map price to price bucket
-        let realized_bucket = map_price_to_bucket(market, &price_struct);
+        // 3) Map price to price bucket (pure function, no extra borrows)
+        let realized_bucket = map_price_to_bucket(
+            num_price_buckets,
+            mid_price_bucket,
+            anchor_price_ref,
+            bucket_size_ref,
+            &price_struct,
+        );
 
-        // 4) Decide win/loss
-        let did_win = realized_bucket == bet_ref.price_bucket;
+        // 4) Load bet data in a small scope (immutable borrow)
+        let bet_user: address;
+        let bet_price_bucket: u8;
+        let bet_expiry_bucket: u64;
+        let bet_stake: u64;
+        let bet_multiplier_bps: u64;
+        {
+            let bet_copy = table::borrow(&market.bets, bet_id);
+            assert!(!bet_copy.settled, error::invalid_argument(E_BET_ALREADY_SETTLED));
+            bet_user = bet_copy.user;
+            bet_price_bucket = bet_copy.price_bucket;
+            bet_expiry_bucket = bet_copy.expiry_bucket;
+            bet_stake = bet_copy.stake;
+            bet_multiplier_bps = bet_copy.multiplier_bps;
+        }; // borrow of bet_copy ends here
+
+        // cannot settle before expiry bucket
+        let now_bucket = timestamp::now_seconds() / time_bucket_seconds;
+        assert!(now_bucket >= bet_expiry_bucket, error::invalid_argument(E_EXPIRY_TOO_SOON));
+
+        // 5) Decide win/loss & pay if win
+        let did_win = realized_bucket == bet_price_bucket;
 
         if (did_win) {
-            let payout = bet_ref.stake * bet_ref.multiplier_bps / 10_000;
+            let payout = bet_stake * bet_multiplier_bps / 10_000;
             let house_balance = coin::value(&market.house_vault);
-            assert!(house_balance >= payout, error::invalid_state(E_HOUSE_INSUFFICIENT_LIQUIDITY));
+            assert!(
+                house_balance >= payout,
+                error::invalid_state(E_HOUSE_INSUFFICIENT_LIQUIDITY)
+            );
 
             let payout_coins = coin::extract(&mut market.house_vault, payout);
-            coin::deposit(bet_ref.user, payout_coins);
+            coin::deposit(bet_user, payout_coins);
         };
 
-        bet_ref.settled = true;
-        bet_ref.won = did_win;
+        // 6) Now mutably borrow bet just to flip flags
+        let bet_ref_mut = table::borrow_mut(&mut market.bets, bet_id);
+        bet_ref_mut.settled = true;
+        bet_ref_mut.won = did_win;
 
         // update spam counter
-        decrement_open_bets(market, bet_ref.user);
+        decrement_open_bets(market, bet_user);
+    }
+
+    /***************
+     *  TEST HELPERS
+     ***************/
+    #[test_only]
+    public fun get_market_state_for_test<CoinType>(
+        admin_addr: address,
+        user_addr: address,
+    ): (u64, u64, u64) acquires Market {
+        let market = borrow_global<Market<CoinType>>(admin_addr);
+
+        let next_bet_id = market.next_bet_id;
+        let house_liquidity = coin::value(&market.house_vault);
+
+        let open_bets_for_user = if (table::contains(&market.user_open_bets, user_addr)) {
+            *table::borrow(&market.user_open_bets, user_addr)
+        } else {
+            0
+        };
+
+        (next_bet_id, open_bets_for_user, house_liquidity)
     }
 }

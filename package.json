@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@aptos-labs/ts-sdk": "^1.39.0",
+    "@privy-io/react-auth": "^1.99.1",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },
