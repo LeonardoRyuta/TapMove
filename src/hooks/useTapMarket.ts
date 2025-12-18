@@ -9,8 +9,18 @@
 
 import { useState, useCallback } from "react";
 import { Account } from "@aptos-labs/ts-sdk";
-import * as tapMarketClient from "../aptos/tapMarketClient";
-import { MARKET_CONFIG } from "../aptos/config";
+import {
+  NUM_PRICE_BUCKETS,
+  LOCKED_COLUMNS_AHEAD,
+  MID_PRICE_BUCKET,
+  MIN_BET_SIZE,
+  MAX_BET_SIZE,
+  computeExpiryTimestampSecs,
+  getCurrentBucket,
+  getFirstBettableBucket,
+} from "../config/tapMarket";
+import { aptosClient } from "../lib/aptosClient";
+import { MODULE_ADDRESS, MODULE_NAME, COIN_TYPE } from "../config/tapMarket";
 
 export interface PlaceBetParams {
   rowIndex: number; // Price bucket index (0 to numPriceBuckets - 1)
@@ -52,7 +62,7 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
       }
 
       // Validate inputs
-      if (rowIndex < 0 || rowIndex >= MARKET_CONFIG.numPriceBuckets) {
+      if (rowIndex < 0 || rowIndex >= NUM_PRICE_BUCKETS) {
         const errorMsg = `Invalid row index: ${rowIndex}`;
         setError(errorMsg);
         throw new Error(errorMsg);
@@ -65,14 +75,14 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
       }
 
       const stakeAmountNum = BigInt(stakeAmount);
-      if (stakeAmountNum < BigInt(MARKET_CONFIG.minBetSize)) {
-        const errorMsg = `Stake amount too small. Minimum: ${MARKET_CONFIG.minBetSize}`;
+      if (stakeAmountNum < MIN_BET_SIZE) {
+        const errorMsg = `Stake amount too small. Minimum: ${MIN_BET_SIZE}`;
         setError(errorMsg);
         throw new Error(errorMsg);
       }
 
-      if (stakeAmountNum > BigInt(MARKET_CONFIG.maxBetSize)) {
-        const errorMsg = `Stake amount too large. Maximum: ${MARKET_CONFIG.maxBetSize}`;
+      if (stakeAmountNum > MAX_BET_SIZE) {
+        const errorMsg = `Stake amount too large. Maximum: ${MAX_BET_SIZE}`;
         setError(errorMsg);
         throw new Error(errorMsg);
       }
@@ -84,13 +94,8 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
         // Convert UI coordinates to contract parameters
         const priceBucket = rowIndex; // Direct mapping: row index = price bucket
         
-        // Convert column index to expiry timestamp
-        // columnIndex 0 = first bettable column after locked ones
-        const expiryTimestampSecs = tapMarketClient.columnIndexToTimestamp(
-          columnIndex,
-          MARKET_CONFIG.timeBucketSeconds,
-          MARKET_CONFIG.lockedColumnsAhead
-        );
+        // Convert column index to expiry timestamp using new config function
+        const expiryTimestampSecs = computeExpiryTimestampSecs(columnIndex);
 
         console.log("Placing bet with params:", {
           priceBucket,
@@ -101,24 +106,38 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
         });
 
         // Check balance before attempting transaction
-        const hasSufficientBalance = await tapMarketClient.checkSufficientBalance(
-          account.accountAddress.toString(),
-          stakeAmount
-        );
+        const balance = await aptosClient.getAccountCoinAmount({
+          accountAddress: account.accountAddress,
+          coinType: COIN_TYPE,
+        });
 
-        if (!hasSufficientBalance) {
+        if (balance < stakeAmountNum) {
           throw new Error("Insufficient balance to place this bet");
         }
 
-        // Place the bet on-chain
-        const txHash = await tapMarketClient.placeBet(account, {
-          priceBucket,
-          expiryTimestampSecs,
-          stakeAmount,
+        // Build transaction
+        const transaction = await aptosClient.transaction.build.simple({
+          sender: account.accountAddress,
+          data: {
+            function: `${MODULE_ADDRESS}::${MODULE_NAME}::place_bet`,
+            typeArguments: [COIN_TYPE],
+            functionArguments: [priceBucket, expiryTimestampSecs, stakeAmount],
+          },
         });
 
-        console.log("Bet placed successfully. Transaction hash:", txHash);
-        return txHash;
+        // Sign and submit
+        const committedTxn = await aptosClient.signAndSubmitTransaction({
+          signer: account,
+          transaction,
+        });
+
+        // Wait for transaction
+        await aptosClient.waitForTransaction({
+          transactionHash: committedTxn.hash,
+        });
+
+        console.log("Bet placed successfully. Transaction hash:", committedTxn.hash);
+        return committedTxn.hash;
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Failed to place bet";
         console.error("Error placing bet:", errorMessage);
@@ -149,14 +168,12 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
  * This provides derived state about which columns are locked, current, etc.
  */
 export function useGridState() {
-  const [currentBucket, setCurrentBucket] = useState(() =>
-    tapMarketClient.getCurrentTimeBucket(MARKET_CONFIG.timeBucketSeconds)
-  );
+  const [currentBucket, setCurrentBucket] = useState(() => getCurrentBucket());
 
   // Update current bucket periodically
   useState(() => {
     const interval = setInterval(() => {
-      const newBucket = tapMarketClient.getCurrentTimeBucket(MARKET_CONFIG.timeBucketSeconds);
+      const newBucket = getCurrentBucket();
       if (newBucket !== currentBucket) {
         setCurrentBucket(newBucket);
       }
@@ -165,15 +182,12 @@ export function useGridState() {
     return () => clearInterval(interval);
   });
 
-  const earliestBettableBucket = tapMarketClient.getEarliestBettableBucket(
-    MARKET_CONFIG.timeBucketSeconds,
-    MARKET_CONFIG.lockedColumnsAhead
-  );
+  const earliestBettableBucket = getFirstBettableBucket();
 
   return {
     currentBucket,
     earliestBettableBucket,
-    lockedColumnsAhead: MARKET_CONFIG.lockedColumnsAhead,
+    lockedColumnsAhead: LOCKED_COLUMNS_AHEAD,
   };
 }
 
@@ -196,12 +210,11 @@ export function calculateMultiplier(rowIndex: number, columnIndex: number): numb
   const MAX_MULT_BPS = 100000; // 10x cap
 
   // Price distance from mid bucket
-  const midBucket = MARKET_CONFIG.midPriceBucket;
-  const priceDistance = Math.abs(rowIndex - midBucket);
+  const priceDistance = Math.abs(rowIndex - MID_PRICE_BUCKET);
 
   // Time bonus only for columns beyond the minimum required
   // Minimum time distance = lockedColumnsAhead + 1
-  const minTimeDistance = MARKET_CONFIG.lockedColumnsAhead + 1;
+  const minTimeDistance = LOCKED_COLUMNS_AHEAD + 1;
   
   // Since columnIndex 0 = earliest bettable column,
   // the actual time distance is minTimeDistance + columnIndex

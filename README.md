@@ -1,23 +1,60 @@
-# React + TypeScript + Vite
+# TapMove - Tap Trading on Movement L1
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A blockchain-based "tap trading" game where users place bets on future price movements in a grid-based interface.
 
-Currently, two official plugins are available:
+## Quick Start
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Babel](https://babeljs.io/) (or [oxc](https://oxc.rs) when used in [rolldown-vite](https://vite.dev/guide/rolldown)) for Fast Refresh
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/) for Fast Refresh
+```bash
+# Install dependencies
+npm install
 
-## React Compiler
+# Create .env file with your Privy App ID and test wallet
+cp .env.example .env
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+# Start development server
+npm run dev
+```
 
-## Expanding the ESLint configuration
+## Project Structure
 
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
+```
+src/
+├── config/tapMarket.ts        # Contract constants & helpers
+├── lib/aptosClient.ts         # Aptos SDK wrapper
+├── hooks/                     # React hooks
+│   ├── usePrivyMovementWallet.ts
+│   └── useTapMarket.ts
+├── components/                # UI components
+│   └── TapGrid.tsx
+├── pages/                     # Application pages
+│   └── TestTapMarket.tsx
+└── App.tsx                    # Main entry
+```
 
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for detailed documentation.
+
+## Contract
+
+- **Address**: `0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c`
+- **Module**: `tap_market`
+- **Network**: Movement L1 (Aptos-based)
+
+## Tech Stack
+
+- React + TypeScript + Vite
+- Aptos TypeScript SDK
+- Privy (wallet authentication)
+- Tailwind CSS
+
+## Development
+
+```bash
+npm run dev      # Start dev server
+npm run build    # Build for production
+npm run lint     # Run ESLint
+```
   {
     files: ['**/*.{ts,tsx}'],
     extends: [

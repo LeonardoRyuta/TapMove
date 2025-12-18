@@ -1,12 +1,8 @@
-import './App.css'
-import { PriceCanvas } from './components/PriceCanvas'
+import './App.css';
+import { TapTradingPage } from './pages/TapTradingPage';
 
 function App() {
-  return (
-    <div className="app-container">
-      <PriceCanvas />
-    </div>
-  )
+  return <TapTradingPage />;
 }
 
-export default App
+export default App;

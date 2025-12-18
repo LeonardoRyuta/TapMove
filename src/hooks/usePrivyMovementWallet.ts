@@ -1,0 +1,216 @@
+/**
+ * Privy integration for Movement wallet
+ * 
+ * This hook wraps Privy's authentication and provides Aptos-compatible signing
+ * using Privy's extended-chains API for Movement/Aptos wallets
+ */
+
+import { useMemo, useEffect, useState } from "react";
+import { usePrivy } from "@privy-io/react-auth";
+import { useCreateWallet } from "@privy-io/react-auth/extended-chains";
+import { useSignRawHash } from "@privy-io/react-auth/extended-chains";
+import {
+  Account,
+  AccountAddress,
+  Ed25519PublicKey,
+  Ed25519Signature,
+  AccountAuthenticatorEd25519,
+  generateSigningMessageForTransaction,
+} from "@aptos-labs/ts-sdk";
+import { aptosClient } from "../lib/aptosClient";
+
+export interface PrivyMovementWallet {
+  ready: boolean;
+  authenticated: boolean;
+  login: () => void;
+  logout: () => Promise<void>;
+  address: string | null;
+  aptosSigner: AptosSigner | null;
+  aptosAccount: Account | null;
+}
+
+export interface AptosSigner {
+  signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;
+}
+
+/**
+ * Hook to integrate Privy with Movement/Aptos
+ * Uses Privy's extended-chains API to create and manage Aptos wallets
+ */
+export function usePrivyMovementWallet(): PrivyMovementWallet {
+  const { ready, authenticated, login, logout, user } = usePrivy();
+  const { createWallet } = useCreateWallet();
+  const { signRawHash } = useSignRawHash();
+  const [isCreatingWallet, setIsCreatingWallet] = useState(false);
+
+  // Create Movement wallet on authentication if not exists
+  useEffect(() => {
+    const setupMovementWallet = async () => {
+      if (!authenticated || !user || isCreatingWallet) return;
+
+      // Check if user already has an Aptos/Movement wallet
+      const moveWallet = user.linkedAccounts?.find(
+        (account: any) => account.chainType === 'aptos'
+      ) as any;
+
+      if (moveWallet) {
+        console.log('Movement wallet exists:', moveWallet.address);
+        return;
+      }
+
+      // Create a new Aptos/Movement wallet
+      console.log('Creating Movement wallet...');
+      setIsCreatingWallet(true);
+      try {
+        const wallet = await createWallet({ chainType: 'aptos' });
+        console.log('Movement wallet created:', (wallet as any).address);
+      } catch (error) {
+        console.error('Error creating Movement wallet:', error);
+      } finally {
+        setIsCreatingWallet(false);
+      }
+    };
+
+    setupMovementWallet();
+  }, [authenticated, user, createWallet, isCreatingWallet]);
+
+  // Create Aptos signer from Privy wallet
+  const { address, aptosSigner, aptosAccount } = useMemo(() => {
+    if (!authenticated || !user) {
+      return { address: null, aptosSigner: null, aptosAccount: null };
+    }
+
+    // Get the Movement wallet from linked accounts
+    const moveWallet = user.linkedAccounts?.find(
+      (account: any) => account.chainType === 'aptos'
+    ) as any;
+
+    if (!moveWallet || !moveWallet.address) {
+      console.log('No Movement wallet found yet');
+      return { address: null, aptosSigner: null, aptosAccount: null };
+    }
+
+    const walletAddress = moveWallet.address;
+    const publicKeyHex = moveWallet.publicKey;
+
+    console.log('Movement wallet loaded:', { address: walletAddress, publicKey: publicKeyHex });
+
+    // Helper to convert Uint8Array to hex
+    const toHex = (buffer: Uint8Array): string => {
+      return Array.from(buffer)
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    };
+
+    // Create signer interface that uses Privy's signRawHash
+    const aptosSigner: AptosSigner = {
+      signAndSubmitTransaction: async (payload: any) => {
+        console.log('Signing transaction with Privy wallet:', walletAddress);
+
+        if (!signRawHash) {
+          throw new Error('signRawHash not available');
+        }
+
+        // Build the transaction
+        const rawTxn = await aptosClient.transaction.build.simple({
+          sender: walletAddress,
+          data: {
+            function: payload.function,
+            typeArguments: payload.typeArguments || [],
+            functionArguments: payload.functionArguments,
+          },
+        });
+
+        // Generate signing message
+        const message = generateSigningMessageForTransaction(rawTxn);
+
+        // Sign with Privy wallet
+        const { signature: rawSignature } = await signRawHash({
+          address: walletAddress,
+          chainType: 'aptos',
+          hash: `0x${toHex(message)}`,
+        });
+
+        // Clean up public key (remove 0x prefix and any leading bytes)
+        let cleanPublicKey = publicKeyHex.startsWith('0x')
+          ? publicKeyHex.slice(2)
+          : publicKeyHex;
+
+        // If public key is 66 characters (33 bytes), remove the first byte (00 prefix)
+        if (cleanPublicKey.length === 66) {
+          cleanPublicKey = cleanPublicKey.slice(2);
+        }
+
+        // Create authenticator
+        const senderAuthenticator = new AccountAuthenticatorEd25519(
+          new Ed25519PublicKey(cleanPublicKey),
+          new Ed25519Signature(
+            rawSignature.startsWith('0x') ? rawSignature.slice(2) : rawSignature
+          )
+        );
+
+        // Submit the signed transaction
+        const committedTxn = await aptosClient.transaction.submit.simple({
+          transaction: rawTxn,
+          senderAuthenticator,
+        });
+
+        console.log('Transaction submitted:', committedTxn.hash);
+
+        // Wait for confirmation
+        const executed = await aptosClient.waitForTransaction({
+          transactionHash: committedTxn.hash,
+        });
+
+        if (!executed.success) {
+          throw new Error('Transaction failed');
+        }
+
+        return { hash: committedTxn.hash };
+      },
+    };
+
+    // Create a mock Account object for compatibility (read-only)
+    // This allows components to get the address via account.accountAddress
+    const mockAccount = {
+      accountAddress: AccountAddress.from(walletAddress),
+    } as Account;
+
+    return {
+      address: walletAddress,
+      aptosSigner,
+      aptosAccount: mockAccount,
+    };
+  }, [authenticated, user, signRawHash]);
+
+  return {
+    ready,
+    authenticated,
+    login,
+    logout,
+    address,
+    aptosSigner,
+    aptosAccount,
+  };
+}
+
+/**
+ * TODO: Production implementation with native Privy Aptos support
+ * 
+ * When Privy adds native Aptos wallet support, update this hook to:
+ * 
+ * 1. Find the Aptos wallet from Privy:
+ *    const { wallets } = useWallets();
+ *    const aptosWallet = wallets.find(w => w.walletClientType === 'aptos');
+ * 
+ * 2. Get the address:
+ *    const address = aptosWallet?.address;
+ * 
+ * 3. Create signer using Privy's signing method:
+ *    const aptosSigner = {
+ *      signAndSubmitTransaction: async (payload) => {
+ *        // Use Privy's method to sign for Aptos
+ *        return await aptosWallet.sign(payload);
+ *      }
+ *    };
+ */
