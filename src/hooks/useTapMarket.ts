@@ -22,6 +22,10 @@ import {
 import { aptosClient } from "../lib/aptosClient";
 import { MODULE_ADDRESS, MODULE_NAME, COIN_TYPE } from "../config/tapMarket";
 
+export interface AptosSigner {
+  signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;  
+}
+
 export interface PlaceBetParams {
   rowIndex: number; // Price bucket index (0 to numPriceBuckets - 1)
   columnIndex: number; // Time column index (0 = first bettable column)
@@ -38,12 +42,16 @@ export interface UseTapMarketReturn {
 /**
  * Hook for placing bets on the tap market
  * 
- * @param account - Aptos account from wallet provider (e.g., Privy)
+ * @param addressOrAccount - Wallet address string or Aptos account
+ * @param signer - Optional custom signer (e.g., from Privy wallet)
  * @returns Functions and state for placing bets
  */
-export function useTapMarket(account: Account | null): UseTapMarketReturn {
+export function useTapMarket(addressOrAccount: string | Account | null, signer?: AptosSigner | null): UseTapMarketReturn {
   const [isPlacing, setIsPlacing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Extract address string from Account or use directly
+  const address = typeof addressOrAccount === 'string' ? addressOrAccount : addressOrAccount?.accountAddress?.toString() || null;
 
   /**
    * Place a bet by clicking on a grid cell
@@ -54,8 +62,8 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
    */
   const placeBet = useCallback(
     async ({ rowIndex, columnIndex, stakeAmount }: PlaceBetParams): Promise<string> => {
-      // Validate account
-      if (!account) {
+      // Validate address
+      if (!address) {
         const errorMsg = "Wallet not connected";
         setError(errorMsg);
         throw new Error(errorMsg);
@@ -107,7 +115,7 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
 
         // Check balance before attempting transaction
         const balance = await aptosClient.getAccountCoinAmount({
-          accountAddress: account.accountAddress,
+          accountAddress: address,
           coinType: COIN_TYPE,
         });
 
@@ -117,7 +125,7 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
 
         // Build transaction
         const transaction = await aptosClient.transaction.build.simple({
-          sender: account.accountAddress,
+          sender: address,
           data: {
             function: `${MODULE_ADDRESS}::${MODULE_NAME}::place_bet`,
             typeArguments: [COIN_TYPE],
@@ -125,11 +133,23 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
           },
         });
 
-        // Sign and submit
-        const committedTxn = await aptosClient.signAndSubmitTransaction({
-          signer: account,
-          transaction,
-        });
+        // Sign and submit using custom signer if provided
+        let committedTxn;
+        if (signer) {
+          // Use Privy's custom signer
+          const payload = {
+            function: `${MODULE_ADDRESS}::${MODULE_NAME}::place_bet`,
+            typeArguments: [COIN_TYPE],
+            functionArguments: [priceBucket, expiryTimestampSecs, stakeAmount],
+          };
+          committedTxn = await signer.signAndSubmitTransaction(payload);
+        } else {
+          // Use standard Aptos client signing
+          committedTxn = await aptosClient.signAndSubmitTransaction({
+            signer: account,
+            transaction,
+          });
+        }
 
         // Wait for transaction
         await aptosClient.waitForTransaction({
@@ -147,7 +167,7 @@ export function useTapMarket(account: Account | null): UseTapMarketReturn {
         setIsPlacing(false);
       }
     },
-    [account]
+    [address, signer]
   );
 
   const clearError = useCallback(() => {

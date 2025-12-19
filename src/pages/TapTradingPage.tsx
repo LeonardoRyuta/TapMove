@@ -34,14 +34,14 @@ interface BetState {
 }
 
 export function TapTradingPage() {
-  const { ready, authenticated, login, logout, address, aptosAccount } =
+  const { ready, authenticated, login, logout, address, aptosAccount, aptosSigner, refreshBalance, balance } =
     usePrivyMovementWallet();
-  const { placeBet, isPlacing, error: placeBetError, clearError } = useTapMarket(aptosAccount);
+  const { placeBet, isPlacing, error: placeBetError, clearError } = useTapMarket(address, aptosSigner);
   const { currentBucket, earliestBettableBucket } = useGridState();
 
   // UI State
   const [priceData, setPriceData] = useState<PricePoint[]>([]);
-  const [stakeAmount, setStakeAmount] = useState<bigint>(1_000_000n); // 0.01 APT in octas
+  const [stakeAmount, setStakeAmount] = useState<bigint>(1_000_000n); // 0.00001 MOVE in octas
   const [stakeInput, setStakeInput] = useState("1000000");
   const [bets, setBets] = useState<Map<string, BetState>>(new Map());
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
@@ -53,8 +53,14 @@ export function TapTradingPage() {
       setPriceData,
       1000 // Update every second
     );
+    
     return cleanup;
   }, []);
+
+  useEffect(() => {
+    // Refresh balance on mount and after placing bets
+    refreshBalance();
+  }, [refreshBalance, isPlacing]);
 
   // Clear success message after 5 seconds
   useEffect(() => {
@@ -243,9 +249,16 @@ export function TapTradingPage() {
 
             {ready && authenticated && (
               <div className="flex items-center gap-3">
+                {/* Balance */}
+                <div className="text-sm text-slate-300 font-mono">
+                  Balance: {/* Placeholder for balance - implement fetching balance as needed */}
+                  <span className="font-bold">{balance !== null ? balance.toFixed(2) : '--.--'} MOVE</span>
+                </div>
                 <div className="flex items-center gap-2 px-4 py-2 bg-slate-800 rounded-lg border border-slate-700">
                   <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-                  <span className="text-sm font-mono text-slate-300">
+                  <span className="text-sm font-mono text-slate-300 hover:cursor-pointer" onClick={() => {
+                    navigator.clipboard.writeText(address || "");
+                  }}>
                     {address?.slice(0, 6)}...{address?.slice(-4)}
                   </span>
                 </div>
@@ -330,27 +343,27 @@ export function TapTradingPage() {
                       placeholder="Enter stake amount"
                     />
                     <div className="mt-2 flex justify-between text-xs text-slate-500">
-                      <span>Min: {(Number(MIN_BET_SIZE) / 100_000_000).toFixed(4)} APT</span>
-                      <span>Max: {(Number(MAX_BET_SIZE) / 100_000_000).toFixed(2)} APT</span>
+                      <span>Min: {(Number(MIN_BET_SIZE) / 100_000_000).toFixed(8)} MOVE</span>
+                      <span>Max: {(Number(MAX_BET_SIZE) / 100_000_000).toFixed(2)} MOVE</span>
                     </div>
                     <p className="text-xs text-slate-400 mt-1">
-                      ≈ {(Number(stakeAmount) / 100_000_000).toFixed(6)} APT
+                      ≈ {(Number(stakeAmount) / 100_000_000).toFixed(6)} MOVE
                     </p>
                   </div>
 
                   {/* Quick stake buttons */}
                   <div className="grid grid-cols-3 gap-2">
-                    {[0.001, 0.01, 0.1].map(apt => (
+                    {[0.001, 0.01, 0.1].map(move => (
                       <button
-                        key={apt}
+                        key={move}
                         onClick={() => {
-                          const octas = BigInt(Math.floor(apt * 100_000_000));
+                          const octas = BigInt(Math.floor(move * 100_000_000));
                           setStakeAmount(octas);
                           setStakeInput(octas.toString());
                         }}
                         className="px-3 py-2 bg-slate-800 hover:bg-slate-700 rounded-lg text-xs font-medium transition-colors border border-slate-700"
                       >
-                        {apt} APT
+                        {move} MOVE
                       </button>
                     ))}
                   </div>
@@ -422,7 +435,7 @@ export function TapTradingPage() {
                         </div>
                         <div className="flex justify-between items-center text-xs">
                           <span className="text-slate-500">
-                            {(Number(bet.stake) / 100_000_000).toFixed(4)} APT
+                            {(Number(bet.stake) / 100_000_000).toFixed(4)} MOVE
                           </span>
                           <span
                             className={`font-medium ${

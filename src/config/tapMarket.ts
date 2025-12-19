@@ -6,9 +6,9 @@
 export const MOVEMENT_NODE_URL = "https://testnet.movementnetwork.xyz/v1";
 
 // Contract deployment addresses
-export const MODULE_ADDRESS = "0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c";
+export const MODULE_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c";
 export const MODULE_NAME = "tap_market";
-export const MARKET_ADMIN_ADDRESS = "0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c";
+export const MARKET_ADMIN_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c";
 export const COIN_TYPE = "0x1::aptos_coin::AptosCoin";
 
 // Grid configuration
@@ -18,9 +18,9 @@ export const TIME_BUCKET_SECONDS = 10;
 export const LOCKED_COLUMNS_AHEAD = 1;
 export const MAX_EXPIRY_BUCKETS_AHEAD = 20;
 
-// Bet size limits (in coin units - adjust based on your coin's decimals)
-export const MIN_BET_SIZE = 100_000n;      // 0.001 coins (assuming 8 decimals)
-export const MAX_BET_SIZE = 1_000_000_000n; // 10 coins
+// Bet size limits (in octas - 1 MOVE = 100,000,000 octas)
+export const MIN_BET_SIZE = 100_000n;      // 0.001 MOVE
+export const MAX_BET_SIZE = 1_000_000_000n; // 10 MOVE
 
 // UI configuration
 export const NUM_VISIBLE_TIME_COLUMNS = 12;

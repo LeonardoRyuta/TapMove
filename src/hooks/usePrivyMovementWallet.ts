@@ -27,6 +27,8 @@ export interface PrivyMovementWallet {
   address: string | null;
   aptosSigner: AptosSigner | null;
   aptosAccount: Account | null;
+  balance: number | null;
+  refreshBalance: () => Promise<void>;
 }
 
 export interface AptosSigner {
@@ -42,6 +44,7 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
   const { createWallet } = useCreateWallet();
   const { signRawHash } = useSignRawHash();
   const [isCreatingWallet, setIsCreatingWallet] = useState(false);
+  const [balance, setBalance] = useState<number | null>(null);
 
   // Create Movement wallet on authentication if not exists
   useEffect(() => {
@@ -64,6 +67,17 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
       try {
         const wallet = await createWallet({ chainType: 'aptos' });
         console.log('Movement wallet created:', (wallet as any).address);
+
+        const coinType = "0x1::aptos_coin::AptosCoin";
+        const [balanceStr] = await aptosClient.view<[string]>({
+          payload: {
+            function: "0x1::coin::balance",
+            typeArguments: [coinType],
+            functionArguments: [(wallet as any).address],
+          },
+        });
+        const balanceNum = parseInt(balanceStr, 10) / 100_000_000;
+        setBalance(balanceNum);
       } catch (error) {
         console.error('Error creating Movement wallet:', error);
       } finally {
@@ -181,7 +195,21 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
       aptosSigner,
       aptosAccount: mockAccount,
     };
-  }, [authenticated, user, signRawHash]);
+  }, [authenticated, user, signRawHash, balance]);
+
+  const refreshBalance = async () => {
+    if (!address) return;
+    const coinType = "0x1::aptos_coin::AptosCoin";
+    const [balanceStr] = await aptosClient.view<[string]>({
+      payload: {
+        function: "0x1::coin::balance",
+        typeArguments: [coinType],
+        functionArguments: [address],
+      },  
+    });
+    const balanceNum = parseInt(balanceStr, 10) / 100_000_000;
+    setBalance(balanceNum);
+  };
 
   return {
     ready,
@@ -191,6 +219,8 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
     address,
     aptosSigner,
     aptosAccount,
+    balance,
+    refreshBalance,
   };
 }
 

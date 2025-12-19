@@ -21,7 +21,7 @@ import {
     getFirstBettableBucket,
 } from "../config/tapMarket";
 
-const DEFAULT_STAKE = 1_000_000n; // 0.01 APT (in octas)
+const DEFAULT_STAKE = 1_000_000n; // 0.00001 MOVE (in octas)
 
 export function TestTapMarket() {
     const { ready, authenticated, login, logout, address, aptosAccount } =
@@ -142,7 +142,7 @@ export function TestTapMarket() {
                         Min: {MIN_BET_SIZE.toString()} | Max: {MAX_BET_SIZE.toString()}
                     </p>
                     <p className="text-sm text-gray-600">
-                        Current: {stake.toString()} octas (≈ {(Number(stake) / 100_000_000).toFixed(4)} APT)
+                        Current: {stake.toString()} octas (≈ {(Number(stake) / 100_000_000).toFixed(4)} MOVE)
                     </p>
                 </div>
 
