@@ -1,5 +1,5 @@
 import './App.css';
-import { TapTradingPage } from './pages/TapTradingPage';
+import { TapTradingPage } from './pages/TapTradingPageNew';
 
 function App() {
   return <TapTradingPage />;

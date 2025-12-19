@@ -12,16 +12,16 @@ import { useState, useEffect, useMemo } from "react";
 import { usePrivyMovementWallet } from "../hooks/usePrivyMovementWallet";
 import { useTapMarket, useGridState, calculateMultiplier } from "../hooks/useTapMarket";
 import { PriceChartWithGrid } from "../components/PriceChartWithGrid";
-import { startLivePriceStream, type PricePoint } from "../utils/priceData";
+import { usePythPriceStream } from "../hooks/usePythPriceStream";
+import { PYTH_PRICE_IDS } from "../lib/pythHermesClient";
 import {
   NUM_PRICE_BUCKETS,
   NUM_VISIBLE_TIME_COLUMNS,
   TIME_BUCKET_SECONDS,
-  LOCKED_COLUMNS_AHEAD,
   MIN_BET_SIZE,
   MAX_BET_SIZE,
 } from "../config/tapMarket";
-import { WalletIcon, TrendingUpIcon, AlertCircleIcon, CheckCircleIcon } from "lucide-react";
+import { WalletIcon, TrendingUpIcon, AlertCircleIcon, CheckCircleIcon, ActivityIcon } from "lucide-react";
 
 interface BetState {
   rowIndex: number;
@@ -39,23 +39,34 @@ export function TapTradingPage() {
   const { placeBet, isPlacing, error: placeBetError, clearError } = useTapMarket(address, aptosSigner);
   const { currentBucket, earliestBettableBucket } = useGridState();
 
+  // Real-time price streaming from Pyth
+  const { 
+    latestPrice, 
+    publishTime, 
+    history: priceHistory, 
+    isLoading: isPriceLoading,
+    isConnected: isPriceConnected,
+    error: priceError,
+    rawData: rawPriceData,
+  } = usePythPriceStream(PYTH_PRICE_IDS.ETH_USD, {
+    maxHistoryPoints: 500,
+    historyDurationSeconds: 300, // 5 minutes
+  });
+
   // UI State
-  const [priceData, setPriceData] = useState<PricePoint[]>([]);
   const [stakeAmount, setStakeAmount] = useState<bigint>(1_000_000n); // 0.00001 MOVE in octas
   const [stakeInput, setStakeInput] = useState("1000000");
   const [bets, setBets] = useState<Map<string, BetState>>(new Map());
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
+  const [showDevMode, setShowDevMode] = useState(false);
 
-  // Start live price data stream
-  useEffect(() => {
-    const cleanup = startLivePriceStream(
-      300, // 5 minutes of history
-      setPriceData,
-      1000 // Update every second
-    );
-    
-    return cleanup;
-  }, []);
+  // Convert Pyth history format to PricePoint format for chart
+  const priceData = useMemo(() => {
+    return priceHistory.map(point => ({
+      timestamp: point.timestamp,
+      price: point.price,
+    }));
+  }, [priceHistory]);
 
   useEffect(() => {
     // Refresh balance on mount and after placing bets
@@ -231,6 +242,31 @@ export function TapTradingPage() {
               Tap Trading
             </h1>
             <span className="text-xs text-slate-500 font-mono">Movement Testnet</span>
+            
+            {/* Price feed status indicator */}
+            <div className="flex items-center gap-2 px-3 py-1 bg-slate-800/50 rounded-full border border-slate-700">
+              <ActivityIcon 
+                size={14} 
+                className={isPriceConnected ? "text-green-400 animate-pulse" : "text-red-400"} 
+              />
+              <span className="text-xs font-mono">
+                {isPriceLoading ? "Connecting..." : isPriceConnected ? "Live ETH/USD" : "Disconnected"}
+              </span>
+              {latestPrice && (
+                <span className="text-xs font-bold text-green-400">
+                  ${latestPrice.toFixed(2)}
+                </span>
+              )}
+            </div>
+            
+            {/* Dev mode toggle */}
+            <button
+              onClick={() => setShowDevMode(!showDevMode)}
+              className="text-xs text-slate-500 hover:text-slate-300 transition-colors"
+              title="Toggle developer mode"
+            >
+              {showDevMode ? "🔧 ON" : "🔧"}
+            </button>
           </div>
 
           {/* Wallet connection */}
@@ -300,21 +336,96 @@ export function TapTradingPage() {
           </div>
         ) : (
           /* Main trading interface */
-          <div className="grid grid-cols-1 xl:grid-cols-[1fr,320px] gap-6">
+          <>
+            {/* Developer mode panel */}
+            {showDevMode && (
+              <div className="mb-4 bg-slate-900 rounded-xl border border-yellow-500/30 p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="text-sm font-bold text-yellow-400">🔧 Developer Mode</h3>
+                  <button
+                    onClick={() => setShowDevMode(false)}
+                    className="text-xs text-slate-500 hover:text-slate-300"
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="grid grid-cols-2 gap-4 text-xs font-mono">
+                  <div>
+                    <span className="text-slate-500">Status:</span>
+                    <span className={`ml-2 font-bold ${isPriceConnected ? 'text-green-400' : 'text-red-400'}`}>
+                      {isPriceConnected ? '✓ Connected' : '✗ Disconnected'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Loading:</span>
+                    <span className="ml-2 text-slate-300">{isPriceLoading ? 'Yes' : 'No'}</span>
+                  </div>
+                  {rawPriceData && (
+                    <>
+                      <div>
+                        <span className="text-slate-500">Raw Price:</span>
+                        <span className="ml-2 text-slate-300">{rawPriceData.price}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Exponent:</span>
+                        <span className="ml-2 text-slate-300">{rawPriceData.expo}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Float Price:</span>
+                        <span className="ml-2 text-green-400 font-bold">
+                          ${latestPrice?.toFixed(2)}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Confidence:</span>
+                        <span className="ml-2 text-slate-300">{rawPriceData.conf}</span>
+                      </div>
+                    </>
+                  )}
+                  {publishTime && (
+                    <>
+                      <div>
+                        <span className="text-slate-500">Publish Time:</span>
+                        <span className="ml-2 text-slate-300">{publishTime}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500">Time (ISO):</span>
+                        <span className="ml-2 text-slate-300">
+                          {new Date(publishTime * 1000).toISOString()}
+                        </span>
+                      </div>
+                    </>
+                  )}
+                  <div>
+                    <span className="text-slate-500">History Points:</span>
+                    <span className="ml-2 text-slate-300">{priceHistory.length}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-500">Current Bucket:</span>
+                    <span className="ml-2 text-slate-300">{currentBucket}</span>
+                  </div>
+                  {priceError && (
+                    <div className="col-span-2">
+                      <span className="text-slate-500">Error:</span>
+                      <span className="ml-2 text-red-400">{priceError.message}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 xl:grid-cols-[1fr,320px] gap-6">
             {/* Chart + Grid */}
             <div className="h-[calc(100vh-180px)] min-h-150">
               <PriceChartWithGrid
                 priceData={priceData}
                 numPriceBuckets={NUM_PRICE_BUCKETS}
                 numTimeColumns={NUM_VISIBLE_TIME_COLUMNS}
-                lockedColumnsAhead={LOCKED_COLUMNS_AHEAD}
-                timeBucketSeconds={TIME_BUCKET_SECONDS}
                 multipliers={multipliers}
                 selectedCells={selectedCells}
                 pendingCells={pendingCells}
                 placedCells={placedCells}
                 onCellClick={handleCellClick}
-                currentBucket={currentBucket}
                 earliestBettableBucket={earliestBettableBucket}
               />
             </div>
@@ -484,6 +595,7 @@ export function TapTradingPage() {
               </div>
             </div>
           </div>
+          </>
         )}
       </div>
     </div>

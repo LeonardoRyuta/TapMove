@@ -18,9 +18,9 @@ import {
   computeExpiryTimestampSecs,
   getCurrentBucket,
   getFirstBettableBucket,
+  COIN_TYPE,
 } from "../config/tapMarket";
-import { aptosClient } from "../lib/aptosClient";
-import { MODULE_ADDRESS, MODULE_NAME, COIN_TYPE } from "../config/tapMarket";
+import { aptosClient, buildPlaceBetPayload } from "../lib/aptosClient";
 
 export interface AptosSigner {
   signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;  
@@ -105,12 +105,23 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         // Convert column index to expiry timestamp using new config function
         const expiryTimestampSecs = computeExpiryTimestampSecs(columnIndex);
 
+        // Build the correct payload with all 4 arguments
+        // Args: market_admin, stake_amount, price_bucket, expiry_timestamp_secs
+        const payload = buildPlaceBetPayload(
+          priceBucket,
+          expiryTimestampSecs,
+          stakeAmountNum
+        );
+
         console.log("Placing bet with params:", {
+          senderAddress: address,
           priceBucket,
           expiryTimestampSecs,
           stakeAmount,
+          stakeAmountNum: stakeAmountNum.toString(),
           rowIndex,
           columnIndex,
+          payload,
         });
 
         // Check balance before attempting transaction
@@ -123,30 +134,26 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
           throw new Error("Insufficient balance to place this bet");
         }
 
-        // Build transaction
-        const transaction = await aptosClient.transaction.build.simple({
-          sender: address,
-          data: {
-            function: `${MODULE_ADDRESS}::${MODULE_NAME}::place_bet`,
-            typeArguments: [COIN_TYPE],
-            functionArguments: [priceBucket, expiryTimestampSecs, stakeAmount],
-          },
-        });
-
         // Sign and submit using custom signer if provided
         let committedTxn;
         if (signer) {
           // Use Privy's custom signer
-          const payload = {
-            function: `${MODULE_ADDRESS}::${MODULE_NAME}::place_bet`,
-            typeArguments: [COIN_TYPE],
-            functionArguments: [priceBucket, expiryTimestampSecs, stakeAmount],
-          };
+          console.log("Using Privy signer with address:", address);
           committedTxn = await signer.signAndSubmitTransaction(payload);
         } else {
           // Use standard Aptos client signing
+          console.log("Using standard Aptos signing");
+          const transaction = await aptosClient.transaction.build.simple({
+            sender: address,
+            data: {
+              function: payload.function as `${string}::${string}::${string}`,
+              typeArguments: payload.typeArguments,
+              functionArguments: payload.functionArguments,
+            },
+          });
+          
           committedTxn = await aptosClient.signAndSubmitTransaction({
-            signer: account,
+            signer: addressOrAccount as Account,
             transaction,
           });
         }
@@ -157,10 +164,18 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         });
 
         console.log("Bet placed successfully. Transaction hash:", committedTxn.hash);
+        setError(null);
         return committedTxn.hash;
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Failed to place bet";
-        console.error("Error placing bet:", errorMessage);
+        console.error("Error placing bet:", {
+          error: errorMessage,
+          fullError: err,
+          senderAddress: address,
+          stakeAmount,
+          priceBucket: rowIndex,
+          expiryTimestampSecs: computeExpiryTimestampSecs(columnIndex),
+        });
         setError(errorMessage);
         throw err;
       } finally {

@@ -40,7 +40,7 @@ export function buildPlaceBetPayload(
       priceBucket,               // price_bucket: u8
       expiryTimestampSecs,       // expiry_timestamp_secs: u64
     ],
-  } as const;
+  };
 }
 
 /**

@@ -1,51 +1,36 @@
 /**
- * PriceChartWithGrid - Main trading visualization component
- * 
- * Displays a live line chart of asset price with an overlaid betting grid
- * for future time buckets. Supports pan/zoom interactions with world coordinates.
+ * DramaticChartWithGrid - Full-screen price chart with 2D panning and betting grid overlay
  */
 
-import React, { useRef, useEffect, useMemo } from "react";
+import { useMemo, useRef, useEffect, type PointerEvent } from "react";
 import { LockIcon } from "lucide-react";
 import { usePanZoom } from "../hooks/usePanZoom";
 
 export interface PricePoint {
-  timestamp: number; // Unix timestamp in seconds
+  timestamp: number;
   price: number;
 }
 
-export interface GridCellState {
+export interface GridCell {
   rowIndex: number;
   columnIndex: number;
   multiplier: number;
   isLocked: boolean;
-  isCurrent: boolean;
   isSelected: boolean;
   isPending: boolean;
   isPlaced: boolean;
 }
 
-export interface PriceChartWithGridProps {
-  // Price data for the chart
+interface DramaticChartWithGridProps {
   priceData: PricePoint[];
-  
-  // Grid configuration
+  latestPrice: number | null;
+  publishTime: number | null;
   numPriceBuckets: number;
   numTimeColumns: number;
-  
-  // Multipliers for each cell [row][column]
-  multipliers: number[][];
-  
-  // Cell states
-  selectedCells: Set<string>; // Format: "row-col"
-  pendingCells: Set<string>;
-  placedCells: Map<string, { stake: string; txHash?: string }>;
-  
-  // Interaction handlers
+  timeBucketSeconds: number;
+  gridCells: GridCell[];
   onCellClick: (rowIndex: number, columnIndex: number, multiplier: number) => void;
-  
-  // Current state
-  earliestBettableBucket: number;
+  currentBucket: number;
 }
 
 // Constants for world coordinate system
@@ -54,19 +39,14 @@ const WORLD_HEIGHT = 1000; // Logical height for world space
 const VIEWPORT_WIDTH = 1000;
 const VIEWPORT_HEIGHT = 600;
 
-export function PriceChartWithGrid({
+export function DramaticChartWithGrid({
   priceData,
+  latestPrice,
   numPriceBuckets,
   numTimeColumns,
-  multipliers,
-  selectedCells,
-  pendingCells,
-  placedCells,
+  gridCells,
   onCellClick,
-  earliestBettableBucket,
-}: PriceChartWithGridProps) {
-  const containerRef = useRef<HTMLDivElement>(null);
-
+}: DramaticChartWithGridProps) {
   // Calculate world coordinate ranges and scaling functions
   const worldData = useMemo(() => {
     if (priceData.length < 2) {
@@ -209,13 +189,13 @@ export function PriceChartWithGrid({
     }
 
     return path;
-  }, [priceData, dataToWorld, panZoom.worldToScreenX, panZoom.worldToScreenY, panZoom.worldOffsetX, panZoom.worldOffsetY, panZoom.zoom]);
+  }, [priceData, dataToWorld, panZoom]);
 
   // Calculate NOW line screen position
   const nowLineScreenX = panZoom.worldToScreenX(dataToWorld.nowWorldX);
-  const currentPrice = priceData.length > 0 ? priceData[priceData.length - 1].price : 100;
 
   // Calculate grid positioning in world space
+  // Grid should be FIXED based on price buckets, not moving with current price
   const gridWorldLayout = useMemo(() => {
     const { nowWorldX } = dataToWorld;
     
@@ -240,6 +220,9 @@ export function PriceChartWithGrid({
       return gridEndWorldY - rowIndex * rowHeight;
     };
     
+    // Helper: convert price to world Y using the same scale as the price line
+    const priceToWorldY = dataToWorld.priceToWorldY;
+    
     return {
       gridStartWorldX,
       gridEndWorldX,
@@ -248,36 +231,29 @@ export function PriceChartWithGrid({
       gridStartWorldY,
       gridEndWorldY,
       rowToWorldY,
+      priceToWorldY,
     };
   }, [dataToWorld, numTimeColumns, numPriceBuckets]);
 
   // Organize cells by position
   const cellsByPosition = useMemo(() => {
-    const map = new Map<string, { multiplier: number; isLocked: boolean; isSelected: boolean; isPending: boolean; isPlaced: boolean }>();
-    
-    for (let row = 0; row < numPriceBuckets; row++) {
-      for (let col = 0; col < numTimeColumns; col++) {
-        const cellKey = `${row}-${col}`;
-        const targetBucket = earliestBettableBucket + col;
-        const isLocked = targetBucket < earliestBettableBucket;
-        const isSelected = selectedCells.has(cellKey);
-        const isPending = pendingCells.has(cellKey);
-        const isPlaced = placedCells.has(cellKey);
-        const multiplier = multipliers[row]?.[col] ?? 1.0;
-        
-        map.set(cellKey, { multiplier, isLocked, isSelected, isPending, isPlaced });
-      }
-    }
+    const map = new Map<string, GridCell>();
+    gridCells.forEach(cell => {
+      map.set(`${cell.rowIndex}-${cell.columnIndex}`, cell);
+    });
     return map;
-  }, [numPriceBuckets, numTimeColumns, earliestBettableBucket, selectedCells, pendingCells, placedCells, multipliers]);
+  }, [gridCells]);
 
   // Handle pointer events with panning check
-  const handleCellPointerDown = (e: React.PointerEvent<HTMLButtonElement>) => {
+  const handleCellPointerDown = (e: PointerEvent<HTMLButtonElement>) => {
     e.stopPropagation(); // Prevent panning when clicking cells
   };
 
   const cursorClass = panZoom.isPanning ? "cursor-grabbing" : "cursor-grab";
   const userSelectClass = panZoom.isPanning ? "select-none" : "";
+
+  // Ref for the container to attach wheel listener with passive: false
+  const containerRef = useRef<HTMLDivElement>(null);
 
   // Attach wheel event listener manually with passive: false
   useEffect(() => {
@@ -290,12 +266,12 @@ export function PriceChartWithGrid({
 
     container.addEventListener('wheel', handleWheel, { passive: false });
     return () => container.removeEventListener('wheel', handleWheel);
-  }, [panZoom.handleWheel]);
+  }, [panZoom]);
 
   return (
     <div 
       ref={containerRef}
-      className={`relative w-full h-full bg-linear-to-br from-[#050816] via-[#0b1020] to-[#0a0618] overflow-hidden rounded-2xl border border-slate-800 shadow-2xl ${cursorClass} ${userSelectClass}`}
+      className={`relative w-full h-full bg-linear-to-br from-[#050816] via-[#0b1020] to-[#0a0618] overflow-hidden ${cursorClass} ${userSelectClass}`}
       onPointerDown={panZoom.handlePointerDown}
       onPointerMove={panZoom.handlePointerMove}
       onPointerUp={panZoom.handlePointerUp}
@@ -305,7 +281,7 @@ export function PriceChartWithGrid({
       <div className="absolute top-4 left-4 z-50 text-white text-xs bg-black/50 p-2 rounded pointer-events-none">
         <div>Data points: {priceData.length}</div>
         <div>Path length: {chartPath.length}</div>
-        <div>Price: ${currentPrice.toFixed(2)}</div>
+        <div>Price: ${latestPrice?.toFixed(2) ?? 'N/A'}</div>
         <div>Pan: ({panZoom.worldOffsetX.toFixed(0)}, {panZoom.worldOffsetY.toFixed(0)})</div>
         <div>Zoom: {panZoom.zoom.toFixed(2)}x</div>
       </div>
@@ -405,17 +381,17 @@ export function PriceChartWithGrid({
       )}
 
       {/* Current price pill on NOW line */}
-      {priceData.length > 0 && (
+      {latestPrice && priceData.length > 0 && (
         <div
           className="absolute px-3 py-1.5 bg-emerald-500/20 border border-emerald-500/50 rounded-lg backdrop-blur-sm pointer-events-none z-20"
           style={{ 
             left: `${(nowLineScreenX / VIEWPORT_WIDTH) * 100}%`,
-            top: `${(panZoom.worldToScreenY(dataToWorld.priceToWorldY(currentPrice)) / VIEWPORT_HEIGHT) * 100}%`,
+            top: `${(panZoom.worldToScreenY(dataToWorld.priceToWorldY(latestPrice)) / VIEWPORT_HEIGHT) * 100}%`,
             transform: 'translate(-50%, -50%)' 
           }}
         >
           <span className="text-emerald-300 font-mono text-sm font-bold">
-            ${currentPrice.toFixed(2)}
+            ${latestPrice.toFixed(2)}
           </span>
         </div>
       )}
@@ -424,8 +400,7 @@ export function PriceChartWithGrid({
       <div className="absolute inset-0">
         {Array.from({ length: numPriceBuckets }).map((_, rowIndex) =>
           Array.from({ length: numTimeColumns }).map((_, colIndex) => {
-            const cellKey = `${rowIndex}-${colIndex}`;
-            const cell = cellsByPosition.get(cellKey);
+            const cell = cellsByPosition.get(`${rowIndex}-${colIndex}`);
             if (!cell) return null;
 
             const { isLocked, isSelected, isPending, isPlaced, multiplier } = cell;
@@ -453,7 +428,7 @@ export function PriceChartWithGrid({
 
             return (
               <button
-                key={cellKey}
+                key={`${rowIndex}-${colIndex}`}
                 onClick={() => !isLocked && onCellClick(rowIndex, colIndex, multiplier)}
                 onPointerDown={handleCellPointerDown}
                 disabled={isLocked || isPending}
@@ -507,29 +482,6 @@ export function PriceChartWithGrid({
       >
         Reset View
       </button>
-
-      {/* Legend */}
-      <div className="absolute bottom-4 left-4 z-10 bg-slate-900/80 backdrop-blur-sm rounded-lg p-3 border border-slate-700">
-        <div className="flex flex-col gap-2 text-xs">
-          <div className="flex items-center gap-2">
-            <div className="w-4 h-4 bg-emerald-500/10 border border-emerald-500/30 rounded"></div>
-            <span className="text-slate-300">Bettable</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="w-4 h-4 bg-purple-950/20 border border-purple-900/30 rounded"></div>
-            <span className="text-slate-300">Locked</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="w-4 h-4 bg-yellow-500/40 border border-yellow-400 rounded"></div>
-            <span className="text-slate-300">Selected</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <div className="w-4 h-4 bg-cyan-500/30 border border-cyan-400 rounded"></div>
-            <span className="text-slate-300">Placed</span>
-          </div>
-        </div>
-      </div>
     </div>
   );
 }
-
