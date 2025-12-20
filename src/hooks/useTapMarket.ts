@@ -21,6 +21,7 @@ import {
   COIN_TYPE,
 } from "../config/tapMarket";
 import { aptosClient, buildPlaceBetPayload } from "../lib/aptosClient";
+import { computeMultiplierBps, getExpiryBucket } from "../lib/multipliers";
 
 export interface AptosSigner {
   signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;  
@@ -227,44 +228,28 @@ export function useGridState() {
 }
 
 /**
- * Calculate the multiplier for a given cell (client-side approximation)
+ * Calculate the multiplier for a given cell
  * 
- * This mirrors the on-chain logic for computing multipliers.
- * Used for UI display only - actual multiplier is computed on-chain.
+ * This mirrors the on-chain compute_multiplier_bps logic exactly.
+ * Used for UI display - the actual multiplier is recomputed on-chain.
  * 
- * Formula:
- * - Base: 1.05x (10500 bps)
- * - +0.06x per row from center (600 bps)
- * - +0.08x per column beyond minimum time distance (800 bps)
- * - Capped at 10x (100000 bps)
+ * @param rowIndex - Price bucket (row) index
+ * @param columnIndex - Column index (0 = first bettable column)
+ * @returns Multiplier as decimal (e.g., 1.73 for 1.73x)
  */
 export function calculateMultiplier(rowIndex: number, columnIndex: number): number {
-  const BASE_MULT_BPS = 10500; // 1.05x
-  const DISTANCE_STEP_BPS = 600; // +0.06x per row
-  const TIME_STEP_BPS = 800; // +0.08x per column beyond min
-  const MAX_MULT_BPS = 100000; // 10x cap
-
-  // Price distance from mid bucket
-  const priceDistance = Math.abs(rowIndex - MID_PRICE_BUCKET);
-
-  // Time bonus only for columns beyond the minimum required
-  // Minimum time distance = lockedColumnsAhead + 1
-  const minTimeDistance = LOCKED_COLUMNS_AHEAD + 1;
+  const currentBucket = getCurrentBucket();
+  const expiryBucket = getExpiryBucket(currentBucket, LOCKED_COLUMNS_AHEAD, columnIndex);
   
-  // Since columnIndex 0 = earliest bettable column,
-  // the actual time distance is minTimeDistance + columnIndex
-  const actualTimeDistance = minTimeDistance + columnIndex;
-  const timeBonusDistance = actualTimeDistance - minTimeDistance; // = columnIndex
+  const multBps = computeMultiplierBps({
+    numPriceBuckets: NUM_PRICE_BUCKETS,
+    midPriceBucket: MID_PRICE_BUCKET,
+    lockedColumnsAhead: LOCKED_COLUMNS_AHEAD,
+    priceBucket: rowIndex,
+    expiryBucket,
+    currentBucket,
+  });
 
-  const timeBonusBps = timeBonusDistance * TIME_STEP_BPS;
-
-  // Combine components
-  let multBps = BASE_MULT_BPS + priceDistance * DISTANCE_STEP_BPS + timeBonusBps;
-
-  // Clamp to [10000, MAX_MULT_BPS]
-  if (multBps < 10000) multBps = 10000;
-  if (multBps > MAX_MULT_BPS) multBps = MAX_MULT_BPS;
-
-  // Convert basis points to decimal (10000 bps = 1.00x)
-  return multBps / 10000;
+  // Convert basis points to decimal (10_000 bps = 1.00x)
+  return multBps / 10_000;
 }

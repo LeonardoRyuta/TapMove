@@ -1,0 +1,701 @@
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import { usePrivyMovementWallet } from '../hooks/usePrivyMovementWallet';
+import { useTapMarket, useGridState } from '../hooks/useTapMarket';
+import { usePythPriceStream } from '../hooks/usePythPriceStream';
+import { PYTH_PRICE_IDS } from '../lib/pythHermesClient';
+import {
+  TIME_BUCKET_SECONDS,
+  NUM_PRICE_BUCKETS,
+  MID_PRICE_BUCKET,
+  LOCKED_COLUMNS_AHEAD,
+} from '../config/tapMarket';
+import { computeMultiplierBps, getExpiryBucket } from '../lib/multipliers';
+
+interface PricePoint {
+  timestamp: number;
+  price: number;
+}
+
+interface CanvasState {
+  offsetX: number;
+  offsetY: number;
+  scale: number;
+}
+
+interface BetState {
+  rowIndex: number;      // Blockchain row index
+  columnIndex: number;   // Blockchain column index
+  multiplier: number;    // Locked multiplier
+  stake: number;         // Stake amount in APT
+  status: 'pending' | 'placed' | 'won' | 'lost' | 'error';
+  txHash?: string;
+  errorMessage?: string;
+  placedAt: number;      // Timestamp when bet was placed
+}
+
+// Visual configuration
+const GRID_SIZE = 50; // pixels per grid cell (both width and height for square cells)
+const PRICE_PER_GRID = 1; // $1 per grid cell in Y axis
+const TIME_PER_GRID = TIME_BUCKET_SECONDS * 1000; // ms per grid cell
+const STAKE_AMOUNT = 0.1; // Default stake in APT
+
+export function PriceCanvas() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  
+  // Hooks for blockchain integration
+  const wallet = usePrivyMovementWallet();
+  const { placeBet } = useTapMarket(
+    wallet.address,
+    wallet.aptosSigner
+  );
+  const { currentBucket, earliestBettableBucket } = useGridState();
+  
+  // Pyth price streaming
+  const { latestPrice, publishTime, history } = usePythPriceStream(
+    PYTH_PRICE_IDS.ETH_USD  // Using ETH/USD as default
+  );
+  
+  // Convert Pyth data to our format - memoize to prevent infinite loops
+  const currentPrice = useMemo<PricePoint | null>(
+    () => latestPrice && publishTime
+      ? { price: latestPrice, timestamp: publishTime * 1000 }
+      : null,
+    [latestPrice, publishTime]
+  );
+  
+  const priceHistory = useMemo<PricePoint[]>(
+    () => history.map(h => ({
+      price: h.price,
+      timestamp: h.timestamp * 1000  // Convert to milliseconds
+    })),
+    [history]
+  );
+  
+  // State management
+  const [bets, setBets] = useState<BetState[]>([]);
+  const [canvasState, setCanvasState] = useState<CanvasState>({
+    offsetX: 0,
+    offsetY: 0,
+    scale: 1,
+  });
+  const [isDragging, setIsDragging] = useState(false);
+  const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
+  const [dragStartPos, setDragStartPos] = useState({ x: 0, y: 0 });
+  
+  // Reference price for Y-axis scaling (rounded to nearest whole number for cleaner grid intervals)
+  const referencePriceRef = useRef<number>(Math.round(priceHistory[0]?.price || 100));
+  
+  // Update reference price when data first arrives
+  useEffect(() => {
+    if (priceHistory.length > 0 && referencePriceRef.current === 100) {
+      referencePriceRef.current = Math.round(priceHistory[0].price);
+    }
+  }, [priceHistory]);
+
+  
+  // Check for bet wins based on price reaching cells
+  useEffect(() => {
+    if (!currentPrice || !currentBucket) return;
+    
+    setBets(prevBets => {
+      return prevBets.map(bet => {
+        // Check if this bet should be marked as won
+        // A bet wins if the price is in the price bucket's range and the time bucket matches
+        if (bet.status === 'placed') {
+          // Check if current bucket matches bet column
+          if (currentBucket >= bet.columnIndex) {
+            // Calculate price for this price bucket
+            // Mid bucket (10) = current price
+            // Higher buckets = higher prices (above current)
+            // Lower buckets = lower prices (below current)
+            const bucketOffsetFromMid = bet.rowIndex - MID_PRICE_BUCKET;
+            const bucketPrice = currentPrice.price + (bucketOffsetFromMid * PRICE_PER_GRID);
+            const priceInRange = Math.abs(currentPrice.price - bucketPrice) < PRICE_PER_GRID / 2;
+            
+            if (priceInRange) {
+              return { ...bet, status: 'won' as const };
+            } else if (currentBucket > bet.columnIndex) {
+              // Price has passed this bucket without hitting
+              return { ...bet, status: 'lost' as const };
+            }
+          }
+        }
+        return bet;
+      });
+    });
+  }, [currentPrice, currentBucket]);
+
+
+  // Set initial viewport position when price data arrives
+  const initializedRef = useRef(false);
+  useEffect(() => {
+    if (priceHistory.length > 0 && !initializedRef.current && currentPrice) {
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      const startTime = priceHistory[0].timestamp;
+      const timeX = ((currentPrice.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+      const priceY = ((referencePriceRef.current - currentPrice.price) / PRICE_PER_GRID) * GRID_SIZE;
+
+      // Center the view on the latest price point
+      setCanvasState((prev) => ({
+        ...prev,
+        offsetX: -timeX + canvas.width / 2 - 100,
+        offsetY: -priceY + canvas.height / 2,
+      }));
+      initializedRef.current = true;
+    }
+  }, [priceHistory, currentPrice]);
+
+  const draw = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const { offsetX, offsetY, scale } = canvasState;
+    const width = canvas.width;
+    const height = canvas.height;
+    const startTime = priceHistory.length > 0 ? priceHistory[0].timestamp : Date.now();
+    const referencePrice = referencePriceRef.current;
+
+    // Clear canvas with dark gradient background
+    const gradient = ctx.createLinearGradient(0, 0, width, height);
+    gradient.addColorStop(0, '#050816');
+    gradient.addColorStop(0.5, '#0b1020');
+    gradient.addColorStop(1, '#0a0618');
+    ctx.fillStyle = gradient;
+    ctx.fillRect(0, 0, width, height);
+
+    // Apply transformations
+    ctx.save();
+    ctx.translate(offsetX, offsetY);
+    ctx.scale(scale, scale);
+
+    // Calculate visible area
+    const visibleLeft = -offsetX / scale;
+    const visibleRight = (width - offsetX) / scale;
+    const visibleTop = -offsetY / scale;
+    const visibleBottom = (height - offsetY) / scale;
+
+    // Draw grid with purple tint - increased opacity for visibility
+    ctx.strokeStyle = 'rgba(139, 92, 246, 0.5)';
+    ctx.lineWidth = 2 / scale;
+
+    // Vertical grid lines (time) - align with time buckets
+    let verticalLineCount = 0;
+    if (currentBucket && earliestBettableBucket) {
+      // Calculate which buckets are visible
+      const startBucket = Math.floor((visibleLeft * TIME_PER_GRID / GRID_SIZE + startTime) / (TIME_BUCKET_SECONDS * 1000));
+      const endBucket = Math.ceil((visibleRight * TIME_PER_GRID / GRID_SIZE + startTime) / (TIME_BUCKET_SECONDS * 1000));
+      
+      for (let bucket = startBucket; bucket <= endBucket; bucket++) {
+        const bucketTimestamp = bucket * TIME_BUCKET_SECONDS * 1000;
+        const x = ((bucketTimestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+        
+        ctx.beginPath();
+        ctx.moveTo(x, visibleTop);
+        ctx.lineTo(x, visibleBottom);
+        ctx.stroke();
+        verticalLineCount++;
+      }
+    } else {
+      // Fallback to regular grid if bucket data not available
+      const startGridX = Math.floor(visibleLeft / GRID_SIZE) * GRID_SIZE;
+      for (let x = startGridX; x < visibleRight; x += GRID_SIZE) {
+        ctx.beginPath();
+        ctx.moveTo(x, visibleTop);
+        ctx.lineTo(x, visibleBottom);
+        ctx.stroke();
+        verticalLineCount++;
+      }
+    }
+
+    // Horizontal grid lines (price) - fixed grid
+    const startGridY = Math.floor(visibleTop / GRID_SIZE) * GRID_SIZE;
+    let horizontalLineCount = 0;
+    for (let y = startGridY; y < visibleBottom; y += GRID_SIZE) {
+      ctx.beginPath();
+      ctx.moveTo(visibleLeft, y);
+      ctx.lineTo(visibleRight, y);
+      ctx.stroke();
+      horizontalLineCount++;
+    }
+
+    // Draw price labels - adaptive spacing based on zoom
+    const labelSpacing = scale < 0.5 ? GRID_SIZE * 4 : scale < 1 ? GRID_SIZE * 2 : GRID_SIZE;
+    const shouldDrawPriceLabels = scale > 0.2; // Hide labels when too zoomed out
+    
+    if (shouldDrawPriceLabels) {
+      ctx.fillStyle = '#94a3b8';
+      const fontSize = Math.max(10, 12 / scale);
+      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+      
+      for (let y = startGridY; y < visibleBottom; y += labelSpacing) {
+        const price = referencePrice - (y / GRID_SIZE) * PRICE_PER_GRID;
+        ctx.fillText(`$${price.toFixed(2)}`, visibleLeft + 5 / scale, y - 5 / scale);
+      }
+    }
+
+    // Draw time labels - adaptive spacing based on zoom
+    const timeSpacing = scale < 0.5 ? GRID_SIZE * 40 : scale < 1 ? GRID_SIZE * 20 : GRID_SIZE * 10;
+    const shouldDrawTimeLabels = scale > 0.2; // Hide labels when too zoomed out
+    
+    if (shouldDrawTimeLabels) {
+      const fontSize = Math.max(10, 12 / scale);
+      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
+      
+      const startGridX = Math.floor(visibleLeft / GRID_SIZE) * GRID_SIZE;
+      for (let x = startGridX; x < visibleRight; x += timeSpacing) {
+        const timeOffset = (x / GRID_SIZE) * TIME_PER_GRID;
+        const date = new Date(startTime + timeOffset);
+        const timeStr = date.toLocaleTimeString();
+        ctx.fillText(timeStr, x + 5 / scale, visibleBottom - 10 / scale);
+      }
+    }
+
+    // Draw betting grid ahead of current price
+    if (currentBucket && earliestBettableBucket && currentPrice) {
+      const currentPriceValue = currentPrice.price;
+      
+      // Calculate the current price Y position in the fixed grid
+      const currentPriceY = ((referencePrice - currentPriceValue) / PRICE_PER_GRID) * GRID_SIZE;
+      
+      // Determine which grid row contains the current price
+      // Use Math.floor so the grid cell containing the price is the mid bucket (1.05x)
+      const currentPriceGridRow = Math.floor(currentPriceY / GRID_SIZE);
+      const currentPriceSnappedY = currentPriceGridRow * GRID_SIZE;
+      
+      // Current time column is the currentBucket
+      const currentTimeColumn = currentBucket;
+      
+      // Start betting grid from the earliest bettable bucket
+      const startBetColumn = earliestBettableBucket;
+      const numColumns = 50; // Show 50 columns ahead
+      
+      let cellsDrawn = 0;
+      // Draw betting cells
+      for (let col = startBetColumn; col < startBetColumn + numColumns; col++) {
+        // Convert bucket number to timestamp, then to grid X coordinate
+        const bucketTimestamp = col * TIME_BUCKET_SECONDS * 1000; // milliseconds
+        const cellX = ((bucketTimestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+        
+        // Only draw if visible
+        if (cellX + GRID_SIZE < visibleLeft || cellX > visibleRight) continue;
+        
+        // Draw cells for each price bucket (0 to NUM_PRICE_BUCKETS - 1)
+        // Position them on the fixed grid aligned with current price
+        const startRow = Math.floor(visibleTop / GRID_SIZE) - 1;
+        const endRow = Math.ceil(visibleBottom / GRID_SIZE) + 1;
+        
+        for (let gridRow = startRow; gridRow < endRow; gridRow++) {
+          const cellY = gridRow * GRID_SIZE;
+          
+          // Calculate which price bucket this grid row represents
+          // The row closest to current price is the mid bucket (1.05x)
+          const rowOffsetFromCurrentPrice = gridRow - currentPriceGridRow;
+          const priceBucket = MID_PRICE_BUCKET - rowOffsetFromCurrentPrice;
+          
+          // Only draw if this is a valid price bucket
+          if (priceBucket < 0 || priceBucket >= NUM_PRICE_BUCKETS) continue;
+          
+          cellsDrawn++;
+          
+          // Calculate expiry bucket for this column
+          const expiryBucket = getExpiryBucket(currentBucket, LOCKED_COLUMNS_AHEAD, col - earliestBettableBucket);
+          
+          // Calculate multiplier using contract-accurate function
+          const multBps = computeMultiplierBps({
+            numPriceBuckets: NUM_PRICE_BUCKETS,
+            midPriceBucket: MID_PRICE_BUCKET,
+            lockedColumnsAhead: LOCKED_COLUMNS_AHEAD,
+            priceBucket: priceBucket,
+            expiryBucket,
+            currentBucket,
+          });
+          const multiplier = multBps / 10_000;
+          
+          // Check if there's a bet on this cell
+          const bet = bets.find(b => b.columnIndex === col && b.rowIndex === priceBucket);
+          
+          // Color based on state
+          let bgColor: string;
+          let textColor: string;
+          let strokeColor: string;
+          const displayMultiplier = bet ? bet.multiplier : multiplier;
+          
+          if (bet?.status === 'won') {
+            // Winning cell - bright green
+            bgColor = 'rgba(34, 197, 94, 0.50)';
+            textColor = '#22c55e';
+            strokeColor = 'rgba(34, 197, 94, 1)';
+          } else if (bet?.status === 'pending') {
+            // Pending bet - yellow/orange
+            bgColor = 'rgba(251, 191, 36, 0.30)';
+            textColor = '#fbbf24';
+            strokeColor = 'rgba(251, 191, 36, 0.80)';
+          } else if (bet?.status === 'placed') {
+            // Placed bet - cyan
+            bgColor = 'rgba(6, 182, 212, 0.30)';
+            textColor = '#06b6d4';
+            strokeColor = 'rgba(6, 182, 212, 0.80)';
+          } else if (bet?.status === 'error') {
+            // Error - red
+            bgColor = 'rgba(239, 68, 68, 0.30)';
+            textColor = '#ef4444';
+            strokeColor = 'rgba(239, 68, 68, 0.80)';
+          } else if (col < currentTimeColumn) {
+            // Past cells - dimmed
+            bgColor = 'rgba(71, 85, 105, 0.10)';
+            textColor = '#64748b';
+            strokeColor = 'rgba(71, 85, 105, 0.15)';
+          } else {
+            // Available cells - emerald with varying intensity based on distance from mid bucket
+            const distanceFromMid = Math.abs(priceBucket - MID_PRICE_BUCKET);
+            const opacity = Math.min(0.15 + distanceFromMid * 0.02, 0.25);
+            bgColor = `rgba(16, 185, 129, ${opacity})`;
+            textColor = '#10b981';
+            strokeColor = 'rgba(16, 185, 129, 0.30)';
+          }
+          
+          // Draw cell background
+          ctx.fillStyle = bgColor;
+          ctx.fillRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
+          
+          // Draw cell border
+          ctx.strokeStyle = strokeColor;
+          ctx.lineWidth = (bet?.status === 'won' || bet?.status === 'placed' ? 2 : 1) / scale;
+          ctx.strokeRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
+          
+          // Draw glow effect and star icon if bet was won
+          if (bet?.status === 'won') {
+            const glowIntensity = 0.2 + 0.15 * Math.sin(Date.now() / 300);
+            ctx.shadowColor = '#22c55e';
+            ctx.shadowBlur = 15 / scale;
+            ctx.fillStyle = `rgba(34, 197, 94, ${glowIntensity})`;
+            ctx.fillRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
+            ctx.shadowBlur = 0;
+            
+            // Draw star icon - only if visible enough
+            if (scale > 0.4) {
+              ctx.fillStyle = '#22c55e';
+              const starSize = Math.max(12, 16 / scale);
+              ctx.font = `${starSize}px sans-serif`;
+              ctx.textAlign = 'right';
+              ctx.textBaseline = 'top';
+              ctx.fillText('★', cellX + GRID_SIZE - 5 / scale, cellY + 5 / scale);
+            }
+          }
+          
+          // Draw multiplier text - only if zoomed in enough
+          const shouldDrawMultiplier = scale > 0.3;
+          if (shouldDrawMultiplier) {
+            ctx.fillStyle = textColor;
+            const fontSize = Math.max(8, Math.min(14, 12 / scale));
+            const fontWeight = bet?.status === 'won' ? 'bold' : 'normal';
+            ctx.font = `${fontWeight} ${fontSize}px Inter, system-ui, monospace`;
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(
+              `${displayMultiplier.toFixed(2)}x`,
+              cellX + GRID_SIZE / 2,
+              cellY + GRID_SIZE / 2
+            );
+          }
+        }
+      }
+      
+      // Reset text alignment
+      ctx.textAlign = 'left';
+      ctx.textBaseline = 'alphabetic';
+    }
+
+    // Draw price line with gradient
+    if (priceHistory.length > 1 && currentPrice) {
+      const lineGradient = ctx.createLinearGradient(
+        ((priceHistory[0].timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE,
+        0,
+        ((priceHistory[priceHistory.length - 1].timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE,
+        0
+      );
+      lineGradient.addColorStop(0, 'rgba(236, 72, 153, 0.3)');
+      lineGradient.addColorStop(0.5, 'rgba(168, 85, 247, 0.8)');
+      lineGradient.addColorStop(1, 'rgba(99, 102, 241, 0.3)');
+      
+      ctx.beginPath();
+      ctx.strokeStyle = lineGradient;
+      ctx.lineWidth = 3 / scale;
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+
+      let started = false;
+      for (const point of priceHistory) {
+        const x = ((point.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+        const y = ((referencePrice - point.price) / PRICE_PER_GRID) * GRID_SIZE;
+
+        if (!started) {
+          ctx.moveTo(x, y);
+          started = true;
+        } else {
+          ctx.lineTo(x, y);
+        }
+      }
+      ctx.stroke();
+
+      // Draw glow effect with purple tint
+      ctx.strokeStyle = 'rgba(168, 85, 247, 0.3)';
+      ctx.lineWidth = 6 / scale;
+      ctx.stroke();
+
+      // Draw current price indicator (emerald)
+      const latestX = ((currentPrice.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+      const latestY = ((referencePrice - currentPrice.price) / PRICE_PER_GRID) * GRID_SIZE;
+
+      // Pulsing dot
+      ctx.beginPath();
+      ctx.arc(latestX, latestY, 6 / scale, 0, Math.PI * 2);
+      ctx.fillStyle = '#10b981';
+      ctx.fill();
+
+      ctx.beginPath();
+      ctx.arc(latestX, latestY, 10 / scale, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)';
+      ctx.lineWidth = 2 / scale;
+      ctx.stroke();
+
+      // Current price label - scale aware
+      const fontSize = Math.max(10, Math.min(16, 14 / scale));
+      ctx.fillStyle = '#10b981';
+      ctx.font = `bold ${fontSize}px Inter, system-ui, monospace`;
+      const labelOffset = Math.max(15, 20 / scale);
+      ctx.fillText(`$${currentPrice.price.toFixed(2)}`, latestX + labelOffset, latestY + 5 / scale);
+    }
+
+    ctx.restore();
+  }, [canvasState, priceHistory, currentPrice, bets, currentBucket, earliestBettableBucket]);
+
+  // Draw on canvas whenever state changes
+  useEffect(() => {
+    draw();
+  }, [draw]);
+
+  // Handle canvas resize and initial setup
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const resizeCanvas = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      
+      draw();
+    };
+
+    // Initial resize
+    resizeCanvas();
+    
+    window.addEventListener('resize', resizeCanvas);
+    return () => window.removeEventListener('resize', resizeCanvas);
+  }, [draw]);
+
+  // Handle wheel event for zooming (using ref to add non-passive listener)
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      e.preventDefault();
+      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+
+      const rect = canvas.getBoundingClientRect();
+      const mouseX = e.clientX - rect.left;
+      const mouseY = e.clientY - rect.top;
+
+      setCanvasState((prev) => {
+        const newScale = Math.max(0.1, Math.min(5, prev.scale * zoomFactor));
+        
+        // Zoom towards mouse position
+        const scaleChange = newScale / prev.scale;
+        const newOffsetX = mouseX - (mouseX - prev.offsetX) * scaleChange;
+        const newOffsetY = mouseY - (mouseY - prev.offsetY) * scaleChange;
+
+        return {
+          offsetX: newOffsetX,
+          offsetY: newOffsetY,
+          scale: newScale,
+        };
+      });
+    };
+
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
+    return () => canvas.removeEventListener('wheel', handleWheel);
+  }, []);
+
+  // Mouse event handlers for panning
+  const handleMouseDown = (e: React.MouseEvent) => {
+    setIsDragging(true);
+    setLastMousePos({ x: e.clientX, y: e.clientY });
+    setDragStartPos({ x: e.clientX, y: e.clientY });
+  };
+
+  const handleMouseMove = (e: React.MouseEvent) => {
+    if (!isDragging) return;
+
+    const deltaX = e.clientX - lastMousePos.x;
+    const deltaY = e.clientY - lastMousePos.y;
+
+    setCanvasState((prev) => ({
+      ...prev,
+      offsetX: prev.offsetX + deltaX,
+      offsetY: prev.offsetY + deltaY,
+    }));
+
+    setLastMousePos({ x: e.clientX, y: e.clientY });
+  };
+
+  const handleMouseUp = (e: React.MouseEvent) => {
+    // Check if this was a click (not a drag)
+    const dragDistance = Math.sqrt(
+      Math.pow(e.clientX - dragStartPos.x, 2) + Math.pow(e.clientY - dragStartPos.y, 2)
+    );
+    
+    if (dragDistance < 5) {
+      // This is a click - try to place a bet
+      handleCanvasClick(e);
+    }
+    
+    setIsDragging(false);
+  };
+  
+  const handleCanvasClick = async (e: React.MouseEvent) => {
+    const canvas = canvasRef.current;
+    if (!canvas || priceHistory.length === 0 || !currentPrice || !currentBucket || !earliestBettableBucket) return;
+    
+    // Check wallet authentication
+    if (!wallet.authenticated || !wallet.ready) {
+      await wallet.login();
+      return;
+    }
+    
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+    
+    const { offsetX, offsetY, scale } = canvasState;
+    
+    // Convert screen coordinates to world coordinates
+    const worldX = (mouseX - offsetX) / scale;
+    const worldY = (mouseY - offsetY) / scale;
+    
+    // Convert worldX to bucket number
+    const clickedTimestamp = (worldX / GRID_SIZE) * TIME_PER_GRID + priceHistory[0].timestamp;
+    const col = Math.floor(clickedTimestamp / (TIME_BUCKET_SECONDS * 1000));
+    
+    // Convert worldY to price bucket
+    // Calculate where mid bucket is positioned
+    const currentPriceValue = currentPrice.price;
+    const currentPriceY = ((referencePriceRef.current - currentPriceValue) / PRICE_PER_GRID) * GRID_SIZE;
+    const midBucketY = currentPriceY;
+    
+    // Calculate which price bucket was clicked
+    const bucketOffsetFromMid = -Math.round((worldY - midBucketY) / GRID_SIZE);
+    const priceBucket = MID_PRICE_BUCKET + bucketOffsetFromMid;
+    
+    // Validate price bucket is in range
+    if (priceBucket < 0 || priceBucket >= NUM_PRICE_BUCKETS) {
+      console.log('Clicked outside valid price bucket range');
+      return;
+    }
+    
+    // Only allow betting on cells in the bettable range
+    if (col < earliestBettableBucket) {
+      console.log('Cell is in the past or too close to current time');
+      return;
+    }
+    
+    // Check if a bet already exists on this cell
+    const existingBet = bets.find(b => b.columnIndex === col && b.rowIndex === priceBucket);
+    if (existingBet) {
+      console.log('Bet already exists on this cell');
+      return;
+    }
+    
+    // Calculate expiry bucket for this column
+    const expiryBucket = getExpiryBucket(currentBucket, LOCKED_COLUMNS_AHEAD, col - earliestBettableBucket);
+    
+    // Calculate multiplier using contract-accurate function
+    const multBps = computeMultiplierBps({
+      numPriceBuckets: NUM_PRICE_BUCKETS,
+      midPriceBucket: MID_PRICE_BUCKET,
+      lockedColumnsAhead: LOCKED_COLUMNS_AHEAD,
+      priceBucket: priceBucket,
+      expiryBucket,
+      currentBucket,
+    });
+    const multiplier = multBps / 10_000;
+    
+    // Create pending bet
+    const pendingBet: BetState = {
+      rowIndex: priceBucket,
+      columnIndex: col,
+      multiplier,
+      stake: STAKE_AMOUNT,
+      status: 'pending',
+      placedAt: Date.now(),
+    };
+    
+    setBets(prev => [...prev, pendingBet]);
+    
+    try {
+      // Place bet on chain - stakeAmount must be a string
+      const txHash = await placeBet({
+        rowIndex: priceBucket,
+        columnIndex: col,
+        stakeAmount: STAKE_AMOUNT.toString(),
+      });
+      
+      // Update bet with success
+      setBets(prev => prev.map(b => 
+        b.rowIndex === priceBucket && b.columnIndex === col
+          ? { ...b, status: 'placed', txHash }
+          : b
+      ));
+    } catch (error: any) {
+      console.error('Failed to place bet:', error);
+      
+      // Update bet with error
+      setBets(prev => prev.map(b => 
+        b.rowIndex === priceBucket && b.columnIndex === col
+          ? { ...b, status: 'error', errorMessage: error.message || 'Failed to place bet' }
+          : b
+      ));
+      
+      // Remove error bets after 3 seconds
+      setTimeout(() => {
+        setBets(prev => prev.filter(b => !(b.rowIndex === priceBucket && b.columnIndex === col && b.status === 'error')));
+      }, 3000);
+    }
+  };
+
+  const handleMouseLeave = () => {
+    setIsDragging(false);
+  };
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        display: 'block',
+        width: '100vw',
+        height: '100vh',
+        cursor: isDragging ? 'grabbing' : 'grab',
+        backgroundColor: '#050816',
+      }}
+      onMouseDown={handleMouseDown}
+      onMouseMove={handleMouseMove}
+      onMouseUp={handleMouseUp}
+      onMouseLeave={handleMouseLeave}
+    />
+  );
+}

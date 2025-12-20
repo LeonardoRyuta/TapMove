@@ -81,18 +81,20 @@ export function TapTradingPage() {
     }
   }, [successMessage]);
 
-  // Generate multipliers matrix
+  // Generate multipliers matrix - updates dynamically as currentBucket changes
   const multipliers = useMemo(() => {
     const matrix: number[][] = [];
     for (let row = 0; row < NUM_PRICE_BUCKETS; row++) {
       const rowMultipliers: number[] = [];
       for (let col = 0; col < NUM_VISIBLE_TIME_COLUMNS; col++) {
+        // calculateMultiplier now uses getCurrentBucket() internally
+        // so multipliers update automatically as time advances
         rowMultipliers.push(calculateMultiplier(row, col));
       }
       matrix.push(rowMultipliers);
     }
     return matrix;
-  }, []);
+  }, [currentBucket]); // Re-compute when currentBucket changes
 
   // Determine cell states for visualization
   const selectedCells = useMemo(() => {

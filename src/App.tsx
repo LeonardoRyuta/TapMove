@@ -1,8 +1,9 @@
 import './App.css';
 import { TapTradingPage } from './pages/TapTradingPageNew';
+import { PriceCanvas } from './components/TestChart';
 
 function App() {
-  return <TapTradingPage />;
+  return <PriceCanvas />;
 }
 
 export default App;
