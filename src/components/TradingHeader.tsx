@@ -3,6 +3,7 @@
  */
 
 import { ActivityIcon, WalletIcon } from "lucide-react";
+import { useEffect } from "react";
 
 interface TradingHeaderProps {
   isPriceConnected: boolean;
@@ -25,6 +26,7 @@ export function TradingHeader({
   onLogin,
   onLogout,
 }: TradingHeaderProps) {
+
   return (
     <div className="fixed top-0 left-0 right-0 z-50 bg-[#0b1020]/80 backdrop-blur-xl border-b border-purple-500/20">
       <div className="max-w-[2000px] mx-auto px-6 py-3 flex items-center justify-between">

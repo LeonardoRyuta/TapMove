@@ -10,6 +10,7 @@ import {
   LOCKED_COLUMNS_AHEAD,
 } from '../config/tapMarket';
 import { computeMultiplierBps, getExpiryBucket } from '../lib/multipliers';
+import { FloatingBetButton } from './FloatingBetButton';
 
 interface PricePoint {
   timestamp: number;
@@ -35,9 +36,8 @@ interface BetState {
 
 // Visual configuration
 const GRID_SIZE = 50; // pixels per grid cell (both width and height for square cells)
-const PRICE_PER_GRID = 1; // $1 per grid cell in Y axis
+const PRICE_PER_GRID = 0.5; // $0.50 per grid cell in Y axis
 const TIME_PER_GRID = TIME_BUCKET_SECONDS * 1000; // ms per grid cell
-const STAKE_AMOUNT = 0.1; // Default stake in APT
 
 export function PriceCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -73,6 +73,7 @@ export function PriceCanvas() {
   
   // State management
   const [bets, setBets] = useState<BetState[]>([]);
+  const [stakeAmount, setStakeAmount] = useState<number>(0.1); // Default 0.1 APT
   const [canvasState, setCanvasState] = useState<CanvasState>({
     offsetX: 0,
     offsetY: 0,
@@ -98,30 +99,40 @@ export function PriceCanvas() {
     if (!currentPrice || !currentBucket) return;
     
     setBets(prevBets => {
-      return prevBets.map(bet => {
-        // Check if this bet should be marked as won
-        // A bet wins if the price is in the price bucket's range and the time bucket matches
-        if (bet.status === 'placed') {
-          // Check if current bucket matches bet column
-          if (currentBucket >= bet.columnIndex) {
-            // Calculate price for this price bucket
-            // Mid bucket (10) = current price
-            // Higher buckets = higher prices (above current)
-            // Lower buckets = lower prices (below current)
-            const bucketOffsetFromMid = bet.rowIndex - MID_PRICE_BUCKET;
-            const bucketPrice = currentPrice.price + (bucketOffsetFromMid * PRICE_PER_GRID);
-            const priceInRange = Math.abs(currentPrice.price - bucketPrice) < PRICE_PER_GRID / 2;
-            
-            if (priceInRange) {
-              return { ...bet, status: 'won' as const };
-            } else if (currentBucket > bet.columnIndex) {
-              // Price has passed this bucket without hitting
-              return { ...bet, status: 'lost' as const };
+      return prevBets
+        .map(bet => {
+          // Check if this bet should be marked as won
+          // A bet wins if the price is in the price bucket's range and the time bucket matches
+          if (bet.status === 'placed') {
+            // Check if current bucket matches bet column
+            if (currentBucket >= bet.columnIndex) {
+              // Calculate price for this price bucket
+              // Mid bucket (10) = current price
+              // Higher buckets = higher prices (above current)
+              // Lower buckets = lower prices (below current)
+              const bucketOffsetFromMid = bet.rowIndex - MID_PRICE_BUCKET;
+              const bucketPrice = currentPrice.price + (bucketOffsetFromMid * PRICE_PER_GRID);
+              const priceInRange = Math.abs(currentPrice.price - bucketPrice) < PRICE_PER_GRID / 2;
+              
+              if (priceInRange) {
+                return { ...bet, status: 'won' as const };
+              } else if (currentBucket > bet.columnIndex) {
+                // Price has passed this bucket without hitting
+                return { ...bet, status: 'lost' as const };
+              }
             }
           }
-        }
-        return bet;
-      });
+          return bet;
+        })
+        // Clean up old bets: remove bets after current price is 2 columns ahead
+        .filter(bet => {
+          // Keep pending and error bets for now
+          if (bet.status === 'pending' || bet.status === 'error') return true;
+          
+          // Remove won/lost/placed bets that are more than 2 columns behind current
+          const columnsBehind = currentBucket - bet.columnIndex;
+          return columnsBehind <= 2;
+        });
     });
   }, [currentPrice, currentBucket]);
 
@@ -265,13 +276,17 @@ export function PriceCanvas() {
       // Determine which grid row contains the current price
       // Use Math.floor so the grid cell containing the price is the mid bucket (1.05x)
       const currentPriceGridRow = Math.floor(currentPriceY / GRID_SIZE);
-      const currentPriceSnappedY = currentPriceGridRow * GRID_SIZE;
       
       // Current time column is the currentBucket
       const currentTimeColumn = currentBucket;
       
-      // Start betting grid from the earliest bettable bucket
-      const startBetColumn = earliestBettableBucket;
+      // Draw betting cells - include past cells that have bets placed on them
+      // Find the earliest column that has a bet to ensure we render all active bets
+      const earliestBetColumn = bets.length > 0 
+        ? Math.min(...bets.map(b => b.columnIndex), earliestBettableBucket)
+        : earliestBettableBucket;
+      
+      const startBetColumn = Math.min(earliestBetColumn, earliestBettableBucket);
       const numColumns = 50; // Show 50 columns ahead
       
       let cellsDrawn = 0;
@@ -345,8 +360,13 @@ export function PriceCanvas() {
             bgColor = 'rgba(239, 68, 68, 0.30)';
             textColor = '#ef4444';
             strokeColor = 'rgba(239, 68, 68, 0.80)';
-          } else if (col < currentTimeColumn) {
-            // Past cells - dimmed
+          } else if (bet?.status === 'lost') {
+            // Lost bet - dimmed red
+            bgColor = 'rgba(239, 68, 68, 0.15)';
+            textColor = '#ef4444';
+            strokeColor = 'rgba(239, 68, 68, 0.40)';
+          } else if (col < currentTimeColumn && !bet) {
+            // Past cells without bets - dimmed
             bgColor = 'rgba(71, 85, 105, 0.10)';
             textColor = '#64748b';
             strokeColor = 'rgba(71, 85, 105, 0.15)';
@@ -635,12 +655,15 @@ export function PriceCanvas() {
     });
     const multiplier = multBps / 10_000;
     
+    // Calculate the relative column index (column offset from first bettable bucket)
+    const columnIndex = col - earliestBettableBucket;
+    
     // Create pending bet
     const pendingBet: BetState = {
       rowIndex: priceBucket,
       columnIndex: col,
       multiplier,
-      stake: STAKE_AMOUNT,
+      stake: stakeAmount,
       status: 'pending',
       placedAt: Date.now(),
     };
@@ -648,12 +671,17 @@ export function PriceCanvas() {
     setBets(prev => [...prev, pendingBet]);
     
     try {
-      // Place bet on chain - stakeAmount must be a string
+      // Convert APT to octas (1 APT = 100,000,000 octas)
+      const stakeInOctas = Math.floor(stakeAmount * 100_000_000);
+      
+      // Place bet on chain using relative column index
       const txHash = await placeBet({
         rowIndex: priceBucket,
-        columnIndex: col,
-        stakeAmount: STAKE_AMOUNT.toString(),
+        columnIndex: columnIndex, // Use relative column index
+        stakeAmount: stakeInOctas.toString(),
       });
+
+      wallet.refreshBalance();
       
       // Update bet with success
       setBets(prev => prev.map(b => 
@@ -683,19 +711,27 @@ export function PriceCanvas() {
   };
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        display: 'block',
-        width: '100vw',
-        height: '100vh',
-        cursor: isDragging ? 'grabbing' : 'grab',
-        backgroundColor: '#050816',
-      }}
-      onMouseDown={handleMouseDown}
-      onMouseMove={handleMouseMove}
-      onMouseUp={handleMouseUp}
-      onMouseLeave={handleMouseLeave}
-    />
+    <>
+      <canvas
+        ref={canvasRef}
+        style={{
+          display: 'block',
+          width: '100vw',
+          height: '100vh',
+          cursor: isDragging ? 'grabbing' : 'grab',
+          backgroundColor: '#050816',
+        }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseLeave}
+      />
+      <FloatingBetButton
+        stakeAmount={stakeAmount}
+        onStakeChange={setStakeAmount}
+        minBet={0.01}
+        maxBet={100}
+      />
+    </>
   );
 }

@@ -14,7 +14,7 @@ export const COIN_TYPE = "0x1::aptos_coin::AptosCoin";
 // Grid configuration
 export const NUM_PRICE_BUCKETS = 21;
 export const MID_PRICE_BUCKET = 10;
-export const TIME_BUCKET_SECONDS = 10;
+export const TIME_BUCKET_SECONDS = 5;
 export const LOCKED_COLUMNS_AHEAD = 1;
 export const MAX_EXPIRY_BUCKETS_AHEAD = 20;
 

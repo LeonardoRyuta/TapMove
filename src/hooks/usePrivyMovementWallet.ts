@@ -5,7 +5,7 @@
  * using Privy's extended-chains API for Movement/Aptos wallets
  */
 
-import { useMemo, useEffect, useState } from "react";
+import { useMemo, useEffect, useState, useCallback, useRef } from "react";
 import { usePrivy } from "@privy-io/react-auth";
 import { useCreateWallet } from "@privy-io/react-auth/extended-chains";
 import { useSignRawHash } from "@privy-io/react-auth/extended-chains";
@@ -45,6 +45,7 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
   const { signRawHash } = useSignRawHash();
   const [isCreatingWallet, setIsCreatingWallet] = useState(false);
   const [balance, setBalance] = useState<number | null>(null);
+  const addressRef = useRef<string | null>(null);
 
   // Create Movement wallet on authentication if not exists
   useEffect(() => {
@@ -195,21 +196,49 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
       aptosSigner,
       aptosAccount: mockAccount,
     };
-  }, [authenticated, user, signRawHash, balance]);
+  }, [authenticated, user, signRawHash]);
 
-  const refreshBalance = async () => {
-    if (!address) return;
-    const coinType = "0x1::aptos_coin::AptosCoin";
-    const [balanceStr] = await aptosClient.view<[string]>({
-      payload: {
-        function: "0x1::coin::balance",
-        typeArguments: [coinType],
-        functionArguments: [address],
-      },  
-    });
-    const balanceNum = parseInt(balanceStr, 10) / 100_000_000;
-    setBalance(balanceNum);
-  };
+  // Update addressRef when address changes
+  useEffect(() => {
+    addressRef.current = address;
+  }, [address]);
+
+  // Stable refreshBalance function using useCallback
+  const refreshBalance = useCallback(async () => {
+    const currentAddress = addressRef.current;
+    if (!currentAddress) return;
+    
+    try {
+      const coinType = "0x1::aptos_coin::AptosCoin";
+      const [balanceStr] = await aptosClient.view<[string]>({
+        payload: {
+          function: "0x1::coin::balance",
+          typeArguments: [coinType],
+          functionArguments: [currentAddress],
+        },  
+      });
+      const balanceNum = parseInt(balanceStr, 10) / 100_000_000;
+      setBalance(balanceNum);
+    } catch (error) {
+      console.error('Error fetching balance:', error);
+    }
+  }, []);
+
+  // Auto-refresh balance every 5 seconds when authenticated
+  useEffect(() => {
+    if (!authenticated || !address) return;
+
+    // Initial fetch
+    refreshBalance();
+
+    // Set up interval for periodic refresh
+    const intervalId = setInterval(() => {
+      refreshBalance();
+    }, 5000); // 5 seconds
+
+    // Cleanup interval on unmount or when dependencies change
+    return () => clearInterval(intervalId);
+  }, [authenticated, address, refreshBalance]);
 
   return {
     ready,
