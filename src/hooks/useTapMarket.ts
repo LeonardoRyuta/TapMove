@@ -7,7 +7,7 @@
  * - Integration with wallet provider
  */
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { Account } from "@aptos-labs/ts-sdk";
 import {
   NUM_PRICE_BUCKETS,
@@ -20,8 +20,9 @@ import {
   getFirstBettableBucket,
   COIN_TYPE,
 } from "../config/tapMarket";
-import { aptosClient, buildPlaceBetPayload } from "../lib/aptosClient";
+import { aptosClient, buildPlaceBetPayload, buildSettleBetPayload, extractBetIdFromTransaction } from "../lib/aptosClient";
 import { computeMultiplierBps, getExpiryBucket } from "../lib/multipliers";
+import { fetchPythPriceUpdateData } from "../lib/pythHermesClient";
 
 export interface AptosSigner {
   signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;  
@@ -33,9 +34,21 @@ export interface PlaceBetParams {
   stakeAmount: string; // Amount in coin units (as string for precision)
 }
 
+export interface PlaceBetResult {
+  txHash: string;
+  betId: string | null; // Extracted bet ID from transaction
+}
+
+export interface SettleBetParams {
+  betId: string | number; // Bet ID from on-chain
+  priceId: string; // Pyth price feed ID
+}
+
 export interface UseTapMarketReturn {
-  placeBet: (params: PlaceBetParams) => Promise<string>;
+  placeBet: (params: PlaceBetParams) => Promise<PlaceBetResult>;
+  settleBet: (params: SettleBetParams) => Promise<string>;
   isPlacing: boolean;
+  isSettling: boolean;
   error: string | null;
   clearError: () => void;
 }
@@ -49,6 +62,7 @@ export interface UseTapMarketReturn {
  */
 export function useTapMarket(addressOrAccount: string | Account | null, signer?: AptosSigner | null): UseTapMarketReturn {
   const [isPlacing, setIsPlacing] = useState(false);
+  const [isSettling, setIsSettling] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   // Extract address string from Account or use directly
@@ -165,8 +179,21 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         });
 
         console.log("Bet placed successfully. Transaction hash:", committedTxn.hash);
+        
+        // Extract bet ID from transaction
+        const betId = await extractBetIdFromTransaction(committedTxn.hash);
+        
+        if (betId) {
+          console.log("✅ Bet ID automatically extracted:", betId);
+        } else {
+          console.warn("⚠️ Could not extract bet ID - user will need to enter manually");
+        }
+        
         setError(null);
-        return committedTxn.hash;
+        return {
+          txHash: committedTxn.hash,
+          betId,
+        };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Failed to place bet";
         console.error("Error placing bet:", {
@@ -186,13 +213,116 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
     [address, signer]
   );
 
+  /**
+   * Settle a bet using Pyth price data
+   * 
+   * This calls the settle_bet_public entry function, which is permissionless.
+   * Anyone can settle any bet after it expires.
+   */
+  const settleBet = useCallback(
+    async ({ betId, priceId }: SettleBetParams): Promise<string> => {
+      // Validate address
+      if (!address) {
+        const errorMsg = "Wallet not connected";
+        setError(errorMsg);
+        throw new Error(errorMsg);
+      }
+
+      setIsSettling(true);
+      setError(null);
+
+      try {
+        console.log("🔍 Verifying bet ID exists on-chain...");
+        
+        // Import the verification function
+        const { verifyBetIdExists } = await import('../lib/aptosClient');
+        
+        // Verify bet ID exists before attempting settlement
+        const betExists = await verifyBetIdExists(betId);
+        
+        if (!betExists) {
+          const errorMsg = `Bet ID ${betId} not found on-chain. The bet may have already been settled or the ID was extracted incorrectly.`;
+          console.error("❌", errorMsg);
+          setError(errorMsg);
+          throw new Error(errorMsg);
+        }
+        
+        console.log("✅ Bet ID verified. Fetching Pyth price update for settlement...");
+        
+        // Fetch latest price update from Pyth Hermes
+        const pythPriceUpdate = await fetchPythPriceUpdateData(priceId);
+        
+        console.log("Building settlement transaction...");
+        
+        // Build the settlement payload
+        const payload = buildSettleBetPayload(betId, pythPriceUpdate);
+
+        console.log("Settling bet with params:", {
+          senderAddress: address,
+          betId,
+          priceId,
+          payload,
+        });
+
+        // Sign and submit using custom signer if provided
+        let committedTxn;
+        if (signer) {
+          // Use Privy's custom signer
+          console.log("Using Privy signer for settlement");
+          committedTxn = await signer.signAndSubmitTransaction(payload);
+          console.log("Settlement transaction submitted with Privy signer:", committedTxn.hash);
+        } else {
+          // Use standard Aptos client signing
+          console.log("Using standard Aptos signing for settlement");
+          const transaction = await aptosClient.transaction.build.simple({
+            sender: address,
+            data: {
+              function: payload.function as `${string}::${string}::${string}`,
+              typeArguments: payload.typeArguments,
+              functionArguments: payload.functionArguments,
+            },
+          });
+          
+          committedTxn = await aptosClient.signAndSubmitTransaction({
+            signer: addressOrAccount as Account,
+            transaction,
+          });
+        }
+
+        // Wait for transaction
+        await aptosClient.waitForTransaction({
+          transactionHash: committedTxn.hash,
+        });
+
+        console.log("Bet settled successfully. Transaction hash:", committedTxn.hash);
+        setError(null);
+        return committedTxn.hash;
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "Failed to settle bet";
+        console.error("Error settling bet:", {
+          error: errorMessage,
+          fullError: err,
+          senderAddress: address,
+          betId,
+        });
+        setError(errorMessage);
+        throw err;
+      } finally {
+        setIsSettling(false);
+      }
+    },
+    [address, signer, addressOrAccount]
+  );
+
   const clearError = useCallback(() => {
     setError(null);
   }, []);
 
   return {
     placeBet,
+    settleBet,
     isPlacing,
+    isSettling,
     error,
     clearError,
   };
@@ -207,16 +337,19 @@ export function useGridState() {
   const [currentBucket, setCurrentBucket] = useState(() => getCurrentBucket());
 
   // Update current bucket periodically
-  useState(() => {
+  useEffect(() => {
     const interval = setInterval(() => {
       const newBucket = getCurrentBucket();
-      if (newBucket !== currentBucket) {
-        setCurrentBucket(newBucket);
-      }
+      setCurrentBucket(prevBucket => {
+        if (newBucket !== prevBucket) {
+          return newBucket;
+        }
+        return prevBucket;
+      });
     }, 1000); // Check every second
 
     return () => clearInterval(interval);
-  });
+  }, []);
 
   const earliestBettableBucket = getFirstBettableBucket();
 

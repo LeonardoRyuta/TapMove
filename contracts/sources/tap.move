@@ -485,6 +485,92 @@ module tap_market::tap_market {
         decrement_open_bets(market, bet_user);
     }
 
+        /// Anyone can call this to settle a bet once it has expired.
+    /// The caller pays the Pyth update fee; the house vault pays any winnings.
+    ///
+    /// - `market_admin` is the address that owns the Market resource (the house)
+    /// - `caller` is whoever is sending the tx (user, random keeper, etc.)
+    public entry fun settle_bet_public<CoinType>(
+        caller: &signer,
+        market_admin: address,
+        bet_id: u64,
+        pyth_price_update: vector<vector<u8>>,
+    ) acquires Market {
+        let caller_addr = signer::address_of(caller);
+
+        // mutable Market<CoinType> under market_admin
+        assert!(exists<Market<CoinType>>(market_admin), error::not_found(E_NO_MARKET));
+        let market = borrow_global_mut<Market<CoinType>>(market_admin);
+
+        // 1) Compute current bucket *before* touching the bet
+        let now_bucket = current_time_bucket(market);
+
+        // 2) Load bet *immutably* to read its data
+        assert!(table::contains(&market.bets, bet_id), error::not_found(E_INVALID_BET_ID));
+        let bet_user: address;
+        let bet_price_bucket: u8;
+        let bet_expiry_bucket: u64;
+        let bet_stake: u64;
+        let bet_multiplier_bps: u64;
+        {
+            let bet_copy = table::borrow(&market.bets, bet_id);
+            assert!(!bet_copy.settled, error::invalid_argument(E_BET_ALREADY_SETTLED));
+            bet_user = bet_copy.user;
+            bet_price_bucket = bet_copy.price_bucket;
+            bet_expiry_bucket = bet_copy.expiry_bucket;
+            bet_stake = bet_copy.stake;
+            bet_multiplier_bps = bet_copy.multiplier_bps;
+        }; // bet_copy borrow ends here
+
+        // 3) Ensure we are at/after expiry
+        assert!(now_bucket >= bet_expiry_bucket, error::invalid_argument(E_EXPIRY_TOO_SOON));
+
+        // 4) Caller pays Pyth fee in AptosCoin
+        let fee = pyth::get_update_fee(&pyth_price_update);
+        let fee_coins = coin::withdraw(caller, fee);
+        pyth::update_price_feeds(pyth_price_update, fee_coins);
+
+        // 5) Read price from Pyth (hardcoded feed ID for MVP; replace with your asset)
+        let price_identifier_bytes =
+            x"ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace";
+        let price_id = price_identifier::from_byte_vec(price_identifier_bytes);
+        let price_struct: Price = pyth::get_price(price_id);
+
+        // 6) Map price to bucket using market config
+        let realized_bucket = map_price_to_bucket(
+            market.num_price_buckets,
+            market.mid_price_bucket,
+            &market.anchor_price,
+            &market.bucket_size,
+            &price_struct,
+        );
+        let did_win = realized_bucket == bet_price_bucket;
+
+        // 7) Pay out if win (uses house_vault)
+        if (did_win) {
+            let payout = bet_stake * bet_multiplier_bps / 10_000;
+            let house_balance = coin::value(&market.house_vault);
+            assert!(
+                house_balance >= payout,
+                error::invalid_state(E_HOUSE_INSUFFICIENT_LIQUIDITY)
+            );
+
+            let payout_coins = coin::extract(&mut market.house_vault, payout);
+            coin::deposit(bet_user, payout_coins);
+        };
+
+        // 8) Now mutably borrow bet just to update flags
+        let bet_ref_mut = table::borrow_mut(&mut market.bets, bet_id);
+        bet_ref_mut.settled = true;
+        bet_ref_mut.won = did_win;
+
+        // 9) Update spam counter
+        decrement_open_bets<CoinType>(market, bet_user);
+    }
+
+
+
+
     /***************
      *  TEST HELPERS
      ***************/

@@ -3,7 +3,6 @@
  */
 
 import { ActivityIcon, WalletIcon } from "lucide-react";
-import { useEffect } from "react";
 
 interface TradingHeaderProps {
   isPriceConnected: boolean;
@@ -71,7 +70,7 @@ export function TradingHeader({
               )}
               <div className="flex items-center gap-2 px-4 py-2 bg-gradient-to-r from-purple-600/20 to-pink-600/20 rounded-lg border border-purple-500/30">
                 <div className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" />
-                <span className="text-sm font-mono text-white">
+                <span className="text-sm font-mono text-white hover:cursor-pointer" onClick={() => navigator.clipboard.writeText(address || '')}>
                   {address?.slice(0, 6)}...{address?.slice(-4)}
                 </span>
               </div>

@@ -8,6 +8,7 @@ import {
   NUM_PRICE_BUCKETS,
   MID_PRICE_BUCKET,
   LOCKED_COLUMNS_AHEAD,
+  computeExpiryTimestampSecs,
 } from '../config/tapMarket';
 import { computeMultiplierBps, getExpiryBucket } from '../lib/multipliers';
 import { FloatingBetButton } from './FloatingBetButton';
@@ -28,10 +29,13 @@ interface BetState {
   columnIndex: number;   // Blockchain column index
   multiplier: number;    // Locked multiplier
   stake: number;         // Stake amount in APT
-  status: 'pending' | 'placed' | 'won' | 'lost' | 'error';
+  status: 'pending' | 'placed' | 'won' | 'lost' | 'error' | 'settling' | 'settled';
   txHash?: string;
   errorMessage?: string;
   placedAt: number;      // Timestamp when bet was placed
+  betId?: string | number; // On-chain bet ID (if known)
+  expiryTimestampSecs?: number; // Unix timestamp when bet expires
+  priceFeedId?: string;  // Pyth price feed ID for settlement
 }
 
 // Visual configuration
@@ -44,7 +48,7 @@ export function PriceCanvas() {
   
   // Hooks for blockchain integration
   const wallet = usePrivyMovementWallet();
-  const { placeBet } = useTapMarket(
+  const { placeBet, settleBet, isSettling } = useTapMarket(
     wallet.address,
     wallet.aptosSigner
   );
@@ -93,48 +97,145 @@ export function PriceCanvas() {
     }
   }, [priceHistory]);
 
+  /**
+   * Settle a single bet on-chain
+   */
+  const handleSettleBet = useCallback(async (bet: BetState) => {
+    console.log(`Settling bet at row ${bet.rowIndex}, col ${bet.columnIndex}...`);
+    console.log(`Bet ID: ${bet.betId}, Tx: ${bet.txHash}`);
+
+    if (!bet.betId) {
+      // Fallback: prompt user to enter bet ID manually
+      // This should rarely happen since bet IDs are now auto-extracted
+      const betIdInput = prompt(
+        `Bet ID not found (this shouldn't happen often).\n\n` +
+        `Please check the transaction in the block explorer and enter the bet ID:\n` +
+        `Transaction: ${bet.txHash || 'unknown'}`
+      );
+      if (!betIdInput) return;
+      
+      // Update bet with the ID
+      setBets(prev => prev.map(b => 
+        b === bet ? { ...b, betId: betIdInput } : b
+      ));
+      
+      bet = { ...bet, betId: betIdInput };
+    }
+    
+    if (!bet.priceFeedId) {
+      console.error('Bet missing price feed ID');
+      alert('Cannot settle: Bet is missing price feed ID');
+      return;
+    }
+    
+    // Mark as settling
+    setBets(prev => prev.map(b => 
+      b.rowIndex === bet.rowIndex && b.columnIndex === bet.columnIndex
+        ? { ...b, status: 'settling' }
+        : b
+    ));
+    
+    try {
+      const txHash = await settleBet({
+        betId: bet.betId!,  // Non-null assertion - we checked above
+        priceId: bet.priceFeedId,
+      });
+      
+      console.log('Bet settled:', txHash);
+      
+      // Update bet status to settled
+      setBets(prev => prev.map(b => 
+        b.rowIndex === bet.rowIndex && b.columnIndex === bet.columnIndex
+          ? { ...b, status: 'settled', txHash }
+          : b
+      ));
+      
+      // Refresh wallet balance
+      wallet.refreshBalance();
+    } catch (error: unknown) {
+      console.error('Failed to settle bet:', error);
+      
+      const errorMessage = error instanceof Error ? error.message : 'Failed to settle bet';
+      
+      // Check for common error patterns
+      if (errorMessage.includes('0x6507')) {
+        // Table entry not found - bet ID doesn't exist on-chain
+        alert(
+          `Settlement failed: Bet ID ${bet.betId} not found on-chain.\n\n` +
+          `This could mean:\n` +
+          `• The bet was already settled\n` +
+          `• The bet ID was extracted incorrectly\n` +
+          `• Transaction: ${bet.txHash}\n\n` +
+          `Check the explorer to verify the bet status.`
+        );
+      } else if (errorMessage.includes('E_EXPIRY_TOO_SOON')) {
+        alert(`Settlement failed: Bet has not expired yet. Wait until after ${new Date((bet.expiryTimestampSecs || 0) * 1000).toLocaleString()}`);
+      } else {
+        alert(`Settlement failed: ${errorMessage}`);
+      }
+      
+      // Revert to placed status on error
+      setBets(prev => prev.map(b => 
+        b.rowIndex === bet.rowIndex && b.columnIndex === bet.columnIndex
+          ? { ...b, status: 'placed', errorMessage }
+          : b
+      ));
+    }
+  }, [settleBet, wallet]);
+
   
-  // Check for bet wins based on price reaching cells
+  // Auto-trigger settlement for eligible bets
   useEffect(() => {
-    if (!currentPrice || !currentBucket) return;
+    if (!currentBucket || !wallet.authenticated) return;
+    
+    const nowSec = Math.floor(Date.now() / 1000);
+    
+    // Find bets that are placed/won/lost and past their expiry time
+    // Include 'won' and 'lost' because local detection marks them before settlement
+    const betsToSettle = bets.filter(bet => 
+      (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+      bet.expiryTimestampSecs && 
+      bet.expiryTimestampSecs <= nowSec &&
+      bet.betId // Only settle if we have a bet ID
+    );
+    
+    // Log bets waiting for betId
+    const betsNeedingId = bets.filter(bet => 
+      (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+      bet.expiryTimestampSecs && 
+      bet.expiryTimestampSecs <= nowSec &&
+      !bet.betId
+    );
+    
+    if (betsNeedingId.length > 0) {
+      console.log(`⚠️ ${betsNeedingId.length} bet(s) are ready to settle but need Bet ID. Click "Enter Bet ID & Settle" in the panel.`);
+    }
+    
+    // Settle one bet at a time (to avoid overwhelming the network)
+    if (betsToSettle.length > 0 && !isSettling) {
+      const betToSettle = betsToSettle[0];
+      console.log('🔄 Auto-settling bet:', betToSettle);
+      handleSettleBet(betToSettle).catch(err => {
+        console.error('Auto-settlement failed:', err);
+      });
+    }
+  }, [currentBucket, bets, wallet.authenticated, isSettling, handleSettleBet]);
+
+  // Clean up old bets periodically
+  useEffect(() => {
+    if (!currentBucket) return;
     
     setBets(prevBets => {
-      return prevBets
-        .map(bet => {
-          // Check if this bet should be marked as won
-          // A bet wins if the price is in the price bucket's range and the time bucket matches
-          if (bet.status === 'placed') {
-            // Check if current bucket matches bet column
-            if (currentBucket >= bet.columnIndex) {
-              // Calculate price for this price bucket
-              // Mid bucket (10) = current price
-              // Higher buckets = higher prices (above current)
-              // Lower buckets = lower prices (below current)
-              const bucketOffsetFromMid = bet.rowIndex - MID_PRICE_BUCKET;
-              const bucketPrice = currentPrice.price + (bucketOffsetFromMid * PRICE_PER_GRID);
-              const priceInRange = Math.abs(currentPrice.price - bucketPrice) < PRICE_PER_GRID / 2;
-              
-              if (priceInRange) {
-                return { ...bet, status: 'won' as const };
-              } else if (currentBucket > bet.columnIndex) {
-                // Price has passed this bucket without hitting
-                return { ...bet, status: 'lost' as const };
-              }
-            }
-          }
-          return bet;
-        })
-        // Clean up old bets: remove bets after current price is 2 columns ahead
-        .filter(bet => {
-          // Keep pending and error bets for now
-          if (bet.status === 'pending' || bet.status === 'error') return true;
-          
-          // Remove won/lost/placed bets that are more than 2 columns behind current
-          const columnsBehind = currentBucket - bet.columnIndex;
-          return columnsBehind <= 2;
-        });
+      return prevBets.filter(bet => {
+        // Keep pending, error, and settling bets
+        if (bet.status === 'pending' || bet.status === 'error' || bet.status === 'settling') return true;
+        
+        // Remove settled/won/lost bets that are more than 2 columns behind current
+        const columnsBehind = currentBucket - bet.columnIndex;
+        return columnsBehind <= 2;
+      });
     });
-  }, [currentPrice, currentBucket]);
+  }, [currentBucket]);
 
 
   // Set initial viewport position when price data arrives
@@ -195,7 +296,6 @@ export function PriceCanvas() {
     ctx.lineWidth = 2 / scale;
 
     // Vertical grid lines (time) - align with time buckets
-    let verticalLineCount = 0;
     if (currentBucket && earliestBettableBucket) {
       // Calculate which buckets are visible
       const startBucket = Math.floor((visibleLeft * TIME_PER_GRID / GRID_SIZE + startTime) / (TIME_BUCKET_SECONDS * 1000));
@@ -209,7 +309,6 @@ export function PriceCanvas() {
         ctx.moveTo(x, visibleTop);
         ctx.lineTo(x, visibleBottom);
         ctx.stroke();
-        verticalLineCount++;
       }
     } else {
       // Fallback to regular grid if bucket data not available
@@ -219,19 +318,16 @@ export function PriceCanvas() {
         ctx.moveTo(x, visibleTop);
         ctx.lineTo(x, visibleBottom);
         ctx.stroke();
-        verticalLineCount++;
       }
     }
 
     // Horizontal grid lines (price) - fixed grid
     const startGridY = Math.floor(visibleTop / GRID_SIZE) * GRID_SIZE;
-    let horizontalLineCount = 0;
     for (let y = startGridY; y < visibleBottom; y += GRID_SIZE) {
       ctx.beginPath();
       ctx.moveTo(visibleLeft, y);
       ctx.lineTo(visibleRight, y);
       ctx.stroke();
-      horizontalLineCount++;
     }
 
     // Draw price labels - adaptive spacing based on zoom
@@ -289,7 +385,6 @@ export function PriceCanvas() {
       const startBetColumn = Math.min(earliestBetColumn, earliestBettableBucket);
       const numColumns = 50; // Show 50 columns ahead
       
-      let cellsDrawn = 0;
       // Draw betting cells
       for (let col = startBetColumn; col < startBetColumn + numColumns; col++) {
         // Convert bucket number to timestamp, then to grid X coordinate
@@ -314,8 +409,6 @@ export function PriceCanvas() {
           
           // Only draw if this is a valid price bucket
           if (priceBucket < 0 || priceBucket >= NUM_PRICE_BUCKETS) continue;
-          
-          cellsDrawn++;
           
           // Calculate expiry bucket for this column
           const expiryBucket = getExpiryBucket(currentBucket, LOCKED_COLUMNS_AHEAD, col - earliestBettableBucket);
@@ -350,6 +443,16 @@ export function PriceCanvas() {
             bgColor = 'rgba(251, 191, 36, 0.30)';
             textColor = '#fbbf24';
             strokeColor = 'rgba(251, 191, 36, 0.80)';
+          } else if (bet?.status === 'settling') {
+            // Settling - pulsing blue
+            bgColor = 'rgba(59, 130, 246, 0.30)';
+            textColor = '#3b82f6';
+            strokeColor = 'rgba(59, 130, 246, 0.80)';
+          } else if (bet?.status === 'settled') {
+            // Settled - light blue
+            bgColor = 'rgba(59, 130, 246, 0.20)';
+            textColor = '#60a5fa';
+            strokeColor = 'rgba(59, 130, 246, 0.50)';
           } else if (bet?.status === 'placed') {
             // Placed bet - cyan
             bgColor = 'rgba(6, 182, 212, 0.30)';
@@ -658,6 +761,9 @@ export function PriceCanvas() {
     // Calculate the relative column index (column offset from first bettable bucket)
     const columnIndex = col - earliestBettableBucket;
     
+    // Calculate expiry timestamp for settlement
+    const expiryTimestampSecs = computeExpiryTimestampSecs(columnIndex);
+    
     // Create pending bet
     const pendingBet: BetState = {
       rowIndex: priceBucket,
@@ -666,6 +772,8 @@ export function PriceCanvas() {
       stake: stakeAmount,
       status: 'pending',
       placedAt: Date.now(),
+      expiryTimestampSecs,
+      priceFeedId: PYTH_PRICE_IDS.ETH_USD, // Store price feed for later settlement
     };
     
     setBets(prev => [...prev, pendingBet]);
@@ -675,7 +783,7 @@ export function PriceCanvas() {
       const stakeInOctas = Math.floor(stakeAmount * 100_000_000);
       
       // Place bet on chain using relative column index
-      const txHash = await placeBet({
+      const result = await placeBet({
         rowIndex: priceBucket,
         columnIndex: columnIndex, // Use relative column index
         stakeAmount: stakeInOctas.toString(),
@@ -683,19 +791,32 @@ export function PriceCanvas() {
 
       wallet.refreshBalance();
       
-      // Update bet with success
+      // Update bet with success and automatically extracted bet ID
       setBets(prev => prev.map(b => 
         b.rowIndex === priceBucket && b.columnIndex === col
-          ? { ...b, status: 'placed', txHash }
+          ? { 
+              ...b, 
+              status: 'placed', 
+              txHash: result.txHash,
+              betId: result.betId || undefined, // Store bet ID if extracted
+            }
           : b
       ));
-    } catch (error: any) {
+      
+      if (result.betId) {
+        console.log(`✅ Bet placed with ID: ${result.betId}`);
+      } else {
+        console.warn('⚠️ Bet placed but ID not extracted - will need manual entry for settlement');
+      }
+    } catch (error: unknown) {
       console.error('Failed to place bet:', error);
+      
+      const errorMessage = error instanceof Error ? error.message : 'Failed to place bet';
       
       // Update bet with error
       setBets(prev => prev.map(b => 
         b.rowIndex === priceBucket && b.columnIndex === col
-          ? { ...b, status: 'error', errorMessage: error.message || 'Failed to place bet' }
+          ? { ...b, status: 'error', errorMessage }
           : b
       ));
       
@@ -709,6 +830,52 @@ export function PriceCanvas() {
   const handleMouseLeave = () => {
     setIsDragging(false);
   };
+  
+  /**
+   * Auto-settle all eligible bets
+   */
+  const handleAutoSettle = async () => {
+    const nowSec = Math.floor(Date.now() / 1000);
+    console.log('Auto-settling bets at', new Date().toISOString());
+    
+    // Find all bets that are placed/won/lost and past their expiry time
+    const eligibleBets = bets.filter(bet => 
+      (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+      bet.expiryTimestampSecs && 
+      bet.expiryTimestampSecs <= nowSec
+    );
+    
+    if (eligibleBets.length === 0) {
+      alert('No eligible bets to settle');
+      return;
+    }
+    
+    console.log(`Auto-settling ${eligibleBets.length} eligible bets...`);
+    
+    // Settle sequentially to avoid overwhelming the network
+    for (const bet of eligibleBets) {
+      try {
+        console.log(`Settling bet at row ${bet.rowIndex}, col ${bet.columnIndex}...`);
+        await handleSettleBet(bet);
+        // Small delay between settlements
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      } catch (error) {
+        console.error(`Failed to settle bet at row ${bet.rowIndex}, col ${bet.columnIndex}:`, error);
+        // Continue with next bet
+      }
+    }
+  };
+
+  // Calculate eligible bets for settlement
+  const nowSec = Math.floor(Date.now() / 1000);
+  const eligibleForSettlement = bets.filter(bet => 
+    (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+    bet.expiryTimestampSecs && 
+    bet.expiryTimestampSecs <= nowSec
+  );
+  
+  // Bets that need betId before they can be settled
+  const needingBetId = eligibleForSettlement.filter(bet => !bet.betId);
 
   return (
     <>
@@ -732,6 +899,142 @@ export function PriceCanvas() {
         minBet={0.01}
         maxBet={100}
       />
+      
+      {/* Bets Panel - Shows active bets with settlement options */}
+      {bets.length > 0 && (
+        <div className="fixed top-20 right-4 w-80 max-h-[70vh] bg-gradient-to-br from-purple-900/90 to-indigo-900/90 backdrop-blur-md rounded-xl shadow-2xl border border-purple-500/30 overflow-hidden flex flex-col">
+          {/* Header */}
+          <div className="p-4 border-b border-purple-500/30">
+            <div className="flex items-center justify-between mb-2">
+              <h3 className="text-white font-bold text-lg">Active Bets ({bets.length})</h3>
+              {eligibleForSettlement.length > 0 && (
+                <button
+                  onClick={handleAutoSettle}
+                  disabled={isSettling}
+                  className="px-3 py-1 bg-gradient-to-r from-emerald-500 to-green-600 hover:from-emerald-600 hover:to-green-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white text-sm font-semibold transition-all shadow-lg"
+                >
+                  {isSettling ? 'Settling...' : `Settle ${eligibleForSettlement.length}`}
+                </button>
+              )}
+            </div>
+            {/* Debug button to check market state */}
+            <button
+              onClick={async () => {
+                const { getMarketNextBetId } = await import('../lib/aptosClient');
+                const nextBetId = await getMarketNextBetId();
+                alert(`Market next_bet_id: ${nextBetId}\n\nThis means valid bet IDs are 0 to ${nextBetId ? BigInt(nextBetId) - 1n : 'unknown'}`);
+              }}
+              className="w-full px-2 py-1 bg-indigo-600/50 hover:bg-indigo-600/70 rounded text-white text-xs transition-all"
+            >
+              🔍 Check Market State
+            </button>
+          </div>
+          
+          {/* Bet List */}
+          <div className="overflow-y-auto p-2 space-y-2">
+            {bets.map((bet, idx) => {
+              const isEligible = (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') && bet.expiryTimestampSecs && bet.expiryTimestampSecs <= nowSec;
+              const needsBetId = isEligible && !bet.betId;
+              
+              return (
+                <div
+                  key={idx}
+                  className={`p-3 rounded-lg border backdrop-blur-sm ${
+                    bet.status === 'won' 
+                      ? 'bg-green-500/20 border-green-500/50'
+                      : bet.status === 'lost'
+                      ? 'bg-red-500/20 border-red-500/50'
+                      : bet.status === 'settling'
+                      ? 'bg-blue-500/20 border-blue-500/50'
+                      : bet.status === 'settled'
+                      ? 'bg-blue-400/20 border-blue-400/50'
+                      : bet.status === 'pending'
+                      ? 'bg-yellow-500/20 border-yellow-500/50'
+                      : isEligible
+                      ? 'bg-purple-500/20 border-purple-400/50'
+                      : 'bg-purple-500/10 border-purple-500/30'
+                  }`}
+                >
+                  {/* Bet Info */}
+                  <div className="flex items-start justify-between mb-2">
+                    <div>
+                      <div className="text-white font-semibold text-sm">
+                        ${(bet.stake * bet.multiplier).toFixed(2)} potential
+                      </div>
+                      <div className="text-purple-200 text-xs">
+                        {bet.stake.toFixed(3)} APT × {bet.multiplier.toFixed(2)}x
+                      </div>
+                    </div>
+                    <div className={`text-xs font-bold px-2 py-1 rounded ${
+                      bet.status === 'won' ? 'bg-green-500 text-white'
+                      : bet.status === 'lost' ? 'bg-red-500 text-white'
+                      : bet.status === 'settling' ? 'bg-blue-500 text-white'
+                      : bet.status === 'settled' ? 'bg-blue-400 text-white'
+                      : bet.status === 'pending' ? 'bg-yellow-500 text-white'
+                      : isEligible ? 'bg-purple-500 text-white'
+                      : 'bg-purple-700 text-purple-200'
+                    }`}>
+                      {bet.status === 'settling' ? 'SETTLING...' 
+                       : bet.status === 'settled' ? 'SETTLED'
+                       : isEligible ? 'READY'
+                       : bet.status.toUpperCase()}
+                    </div>
+                  </div>
+                  
+                  {/* Position */}
+                  <div className="text-purple-300 text-xs mb-2">
+                    Row {bet.rowIndex} • Col {bet.columnIndex - (earliestBettableBucket || 0)}
+                    {bet.expiryTimestampSecs && (
+                      <span className="ml-2">
+                        • Expires: {new Date(bet.expiryTimestampSecs * 1000).toLocaleTimeString()}
+                      </span>
+                    )}
+                    {needsBetId && (
+                      <div className="mt-1 text-yellow-400 font-semibold">
+                        ⚠️ Needs Bet ID to settle
+                      </div>
+                    )}
+                  </div>
+                  
+                  {/* Actions */}
+                  {isEligible && (
+                    <button
+                      onClick={() => handleSettleBet(bet)}
+                      disabled={isSettling || bet.status === 'settling'}
+                      className="w-full mt-2 px-3 py-1.5 bg-gradient-to-r from-purple-500 to-pink-600 hover:from-purple-600 hover:to-pink-700 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg text-white text-xs font-semibold transition-all"
+                    >
+                      {bet.status === 'settling' ? 'Settling...' : needsBetId ? 'Enter Bet ID & Settle' : 'Settle Bet'}
+                    </button>
+                  )}
+                  
+                  {/* Transaction Hash */}
+                  {bet.txHash && (
+                    <div className="mt-2 text-xs text-purple-300 truncate">
+                      Tx: {bet.txHash.slice(0, 8)}...{bet.txHash.slice(-6)}
+                    </div>
+                  )}
+                  
+                  {/* Error Message */}
+                  {bet.errorMessage && (
+                    <div className="mt-2 text-xs text-red-400">
+                      Error: {bet.errorMessage}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+          
+          {/* Footer */}
+          <div className="p-3 border-t border-purple-500/30 text-xs text-purple-300 text-center">
+            {eligibleForSettlement.length > 0 
+              ? needingBetId.length > 0
+                ? `${eligibleForSettlement.length} bet(s) ready • ${needingBetId.length} need Bet ID`
+                : `${eligibleForSettlement.length} bet(s) ready to settle`
+              : 'No bets ready to settle yet'}
+          </div>
+        </div>
+      )}
     </>
   );
 }
