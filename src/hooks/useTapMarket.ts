@@ -20,12 +20,14 @@ import {
   getFirstBettableBucket,
   COIN_TYPE,
 } from "../config/tapMarket";
-import { aptosClient, buildPlaceBetPayload, buildSettleBetPayload, extractBetIdFromTransaction } from "../lib/aptosClient";
+import { aptosClient, buildPlaceBetPayload, buildSettleBetPayload, buildSettleBetNoPythPayload, extractBetIdFromTransaction } from "../lib/aptosClient";
+import type { TransactionPayload } from "../lib/aptosClient";
 import { computeMultiplierBps, getExpiryBucket } from "../lib/multipliers";
 import { fetchPythPriceUpdateData } from "../lib/pythHermesClient";
+import { mapPriceToBucket } from "../config/tapMarket";
 
 export interface AptosSigner {
-  signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;  
+  signAndSubmitTransaction: (payload: TransactionPayload) => Promise<{ hash: string }>;  
 }
 
 export interface PlaceBetParams {
@@ -44,9 +46,16 @@ export interface SettleBetParams {
   priceId: string; // Pyth price feed ID
 }
 
+export interface SettleBetNoPythParams {
+  betId: string | number; // Bet ID from on-chain
+  currentPrice: number; // Current price for bucket calculation
+  referencePrice?: number; // Optional reference price for grid alignment
+}
+
 export interface UseTapMarketReturn {
   placeBet: (params: PlaceBetParams) => Promise<PlaceBetResult>;
   settleBet: (params: SettleBetParams) => Promise<string>;
+  settleBetNoPyth: (params: SettleBetNoPythParams) => Promise<string>;
   isPlacing: boolean;
   isSettling: boolean;
   error: string | null;
@@ -76,7 +85,7 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
    * - columnIndex -> expiry_timestamp_secs (calculated based on time buckets)
    */
   const placeBet = useCallback(
-    async ({ rowIndex, columnIndex, stakeAmount }: PlaceBetParams): Promise<string> => {
+    async ({ rowIndex, columnIndex, stakeAmount }: PlaceBetParams): Promise<PlaceBetResult> => {
       // Validate address
       if (!address) {
         const errorMsg = "Wallet not connected";
@@ -210,7 +219,7 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         setIsPlacing(false);
       }
     },
-    [address, signer]
+    [address, signer, addressOrAccount]
   );
 
   /**
@@ -253,7 +262,14 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         const pythPriceUpdate = await fetchPythPriceUpdateData(priceId);
         
         console.log("Building settlement transaction...");
-        
+        console.log("arguments:", { 
+          betId, 
+          priceId, 
+          pythPriceUpdate: JSON.stringify(pythPriceUpdate, null, 2) 
+        });
+
+        console.log("pythPriceUpdate raw:", pythPriceUpdate[0]);
+
         // Build the settlement payload
         const payload = buildSettleBetPayload(betId, pythPriceUpdate);
 
@@ -314,13 +330,126 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
     [address, signer, addressOrAccount]
   );
 
+  /**
+   * Settle a bet without requiring Pyth price update (MVP version)
+   * 
+   * This calls settle_bet_public_no_pyth which accepts the realized bucket
+   * as a parameter instead of fetching from Pyth on-chain.
+   * 
+   * The realized bucket is calculated on the frontend using the same logic
+   * as the price grid display.
+   */
+  const settleBetNoPyth = useCallback(
+    async ({ betId, currentPrice, referencePrice }: SettleBetNoPythParams): Promise<string> => {
+      // Validate address
+      if (!address) {
+        const errorMsg = "Wallet not connected";
+        setError(errorMsg);
+        throw new Error(errorMsg);
+      }
+
+      setIsSettling(true);
+      setError(null);
+
+      try {
+        console.log("🔍 Verifying bet ID exists on-chain...");
+        
+        // Import the verification function
+        const { verifyBetIdExists } = await import('../lib/aptosClient');
+        
+        // Verify bet ID exists before attempting settlement
+        const betExists = await verifyBetIdExists(betId);
+        
+        if (!betExists) {
+          const errorMsg = `Bet ID ${betId} not found on-chain. The bet may have already been settled or the ID was extracted incorrectly.`;
+          console.error("❌", errorMsg);
+          setError(errorMsg);
+          throw new Error(errorMsg);
+        }
+        
+        console.log("✅ Bet ID verified.");
+        
+        // Calculate the realized bucket using frontend logic
+        // Use the same mapping as the grid display
+        const refPrice = referencePrice ?? Math.round(currentPrice);
+        const realizedBucket = mapPriceToBucket(currentPrice, currentPrice, refPrice);
+        
+        console.log("📊 Settlement details:", {
+          betId,
+          currentPrice,
+          referencePrice: refPrice,
+          realizedBucket,
+        });
+
+        // Build the settlement payload (no Pyth update needed)
+        const payload = buildSettleBetNoPythPayload(betId, realizedBucket);
+
+        console.log("Settling bet with params:", {
+          senderAddress: address,
+          betId,
+          realizedBucket,
+          payload,
+        });
+
+        // Sign and submit using custom signer if provided
+        let committedTxn;
+        if (signer) {
+          // Use Privy's custom signer
+          console.log("Using Privy signer for settlement");
+          committedTxn = await signer.signAndSubmitTransaction(payload);
+          console.log("Settlement transaction submitted with Privy signer:", committedTxn.hash);
+        } else {
+          // Use standard Aptos client signing
+          console.log("Using standard Aptos signing for settlement");
+          const transaction = await aptosClient.transaction.build.simple({
+            sender: address,
+            data: {
+              function: payload.function as `${string}::${string}::${string}`,
+              typeArguments: payload.typeArguments,
+              functionArguments: payload.functionArguments,
+            },
+          });
+          
+          committedTxn = await aptosClient.signAndSubmitTransaction({
+            signer: addressOrAccount as Account,
+            transaction,
+          });
+        }
+
+        // Wait for transaction
+        await aptosClient.waitForTransaction({
+          transactionHash: committedTxn.hash,
+        });
+
+        console.log("✅ Bet settled successfully (no-pyth). Transaction hash:", committedTxn.hash);
+        setError(null);
+        return committedTxn.hash;
+      } catch (err) {
+        const errorMessage = err instanceof Error ? err.message : "Failed to settle bet";
+        console.error("Error settling bet (no-pyth):", {
+          error: errorMessage,
+          fullError: err,
+          senderAddress: address,
+          betId,
+          currentPrice,
+        });
+        setError(errorMessage);
+        throw err;
+      } finally {
+        setIsSettling(false);
+      }
+    },
+    [address, signer, addressOrAccount]
+  );
+
   const clearError = useCallback(() => {
     setError(null);
   }, []);
 
   return {
     placeBet,
-    settleBet,
+    settleBet, // Keep old version for reference
+    settleBetNoPyth, // New MVP version
     isPlacing,
     isSettling,
     error,

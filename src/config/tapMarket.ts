@@ -6,9 +6,9 @@
 export const MOVEMENT_NODE_URL = "https://testnet.movementnetwork.xyz/v1";
 
 // Contract deployment addresses
-export const MODULE_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c";
+export const MODULE_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0xeab4141af6ec0892a42e321e30cde3d4358d7a495aa98078203190248d70c742";
 export const MODULE_NAME = "tap_market";
-export const MARKET_ADMIN_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x92c1c3e45c1b40d8902e793b73c8712002200318bd12bb3c289da7345110755c";
+export const MARKET_ADMIN_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0xeab4141af6ec0892a42e321e30cde3d4358d7a495aa98078203190248d70c742";
 export const COIN_TYPE = "0x1::aptos_coin::AptosCoin";
 
 // Grid configuration
@@ -63,4 +63,46 @@ export function getCurrentBucket(): number {
 export function getFirstBettableBucket(): number {
   const currentBucket = getCurrentBucket();
   return currentBucket + LOCKED_COLUMNS_AHEAD + 1;
+}
+
+/**
+ * Map a price value to a bucket index
+ * 
+ * This uses the same logic as the price grid canvas to determine which
+ * price bucket (row) a given price falls into.
+ * 
+ * The algorithm:
+ * - We have a fixed grid with PRICE_PER_GRID spacing (e.g., $0.50)
+ * - The current price determines which grid row is the "mid bucket"
+ * - We calculate the offset from current price to the given price
+ * - Then map that to a bucket index
+ * 
+ * @param price - The price to map (e.g., ETH price in dollars)
+ * @param currentPrice - The current reference price
+ * @param referencePrice - The Y-axis reference price (for grid alignment)
+ * @param pricePerGrid - Price spacing per grid cell (default 0.5)
+ * @param gridSize - Size of grid cells in pixels (default 50)
+ * @returns Bucket index (0 to NUM_PRICE_BUCKETS - 1)
+ */
+export function mapPriceToBucket(
+  price: number,
+  currentPrice: number,
+  referencePrice: number = Math.round(currentPrice),
+  pricePerGrid: number = 0.5,
+  gridSize: number = 50
+): number {
+  // Calculate Y position in grid coordinates for both prices
+  const currentPriceY = ((referencePrice - currentPrice) / pricePerGrid) * gridSize;
+  const targetPriceY = ((referencePrice - price) / pricePerGrid) * gridSize;
+  
+  // Calculate grid rows
+  const currentPriceGridRow = Math.floor(currentPriceY / gridSize);
+  const targetPriceGridRow = Math.floor(targetPriceY / gridSize);
+  
+  // Calculate bucket: mid bucket minus the row offset
+  const rowOffsetFromCurrentPrice = targetPriceGridRow - currentPriceGridRow;
+  const priceBucket = MID_PRICE_BUCKET - rowOffsetFromCurrentPrice;
+  
+  // Clamp to valid range
+  return Math.max(0, Math.min(NUM_PRICE_BUCKETS - 1, priceBucket));
 }

@@ -45,17 +45,18 @@ const TIME_PER_GRID = TIME_BUCKET_SECONDS * 1000; // ms per grid cell
 
 export function PriceCanvas() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  
+
   // Hooks for blockchain integration
   const wallet = usePrivyMovementWallet();
-  const { placeBet, settleBet, isSettling } = useTapMarket(
+  const { placeBet, settleBetNoPyth, isSettling } = useTapMarket(
     wallet.address,
     wallet.aptosSigner
   );
   const { currentBucket, earliestBettableBucket } = useGridState();
   
   // Pyth price streaming
-  const { latestPrice, publishTime, history } = usePythPriceStream(
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { latestPrice, publishTime, history, isLoading, isConnected, error } = usePythPriceStream(
     PYTH_PRICE_IDS.ETH_USD  // Using ETH/USD as default
   );
   
@@ -98,7 +99,7 @@ export function PriceCanvas() {
   }, [priceHistory]);
 
   /**
-   * Settle a single bet on-chain
+   * Settle a single bet on-chain using no-pyth method
    */
   const handleSettleBet = useCallback(async (bet: BetState) => {
     console.log(`Settling bet at row ${bet.rowIndex}, col ${bet.columnIndex}...`);
@@ -106,7 +107,6 @@ export function PriceCanvas() {
 
     if (!bet.betId) {
       // Fallback: prompt user to enter bet ID manually
-      // This should rarely happen since bet IDs are now auto-extracted
       const betIdInput = prompt(
         `Bet ID not found (this shouldn't happen often).\n\n` +
         `Please check the transaction in the block explorer and enter the bet ID:\n` +
@@ -122,9 +122,10 @@ export function PriceCanvas() {
       bet = { ...bet, betId: betIdInput };
     }
     
-    if (!bet.priceFeedId) {
-      console.error('Bet missing price feed ID');
-      alert('Cannot settle: Bet is missing price feed ID');
+    // Get current price for settlement
+    if (!currentPrice) {
+      console.error('Current price not available');
+      alert('Cannot settle: Current price data not available');
       return;
     }
     
@@ -136,9 +137,11 @@ export function PriceCanvas() {
     ));
     
     try {
-      const txHash = await settleBet({
+      // Use no-pyth settlement with current price
+      const txHash = await settleBetNoPyth({
         betId: bet.betId!,  // Non-null assertion - we checked above
-        priceId: bet.priceFeedId,
+        currentPrice: currentPrice.price,
+        referencePrice: referencePriceRef.current,
       });
       
       console.log('Bet settled:', txHash);
@@ -159,7 +162,6 @@ export function PriceCanvas() {
       
       // Check for common error patterns
       if (errorMessage.includes('0x6507')) {
-        // Table entry not found - bet ID doesn't exist on-chain
         alert(
           `Settlement failed: Bet ID ${bet.betId} not found on-chain.\n\n` +
           `This could mean:\n` +
@@ -181,7 +183,7 @@ export function PriceCanvas() {
           : b
       ));
     }
-  }, [settleBet, wallet]);
+  }, [settleBetNoPyth, wallet, currentPrice]);
 
   
   // Auto-trigger settlement for eligible bets
@@ -191,25 +193,12 @@ export function PriceCanvas() {
     const nowSec = Math.floor(Date.now() / 1000);
     
     // Find bets that are placed/won/lost and past their expiry time
-    // Include 'won' and 'lost' because local detection marks them before settlement
     const betsToSettle = bets.filter(bet => 
       (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
       bet.expiryTimestampSecs && 
       bet.expiryTimestampSecs <= nowSec &&
       bet.betId // Only settle if we have a bet ID
     );
-    
-    // Log bets waiting for betId
-    const betsNeedingId = bets.filter(bet => 
-      (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
-      bet.expiryTimestampSecs && 
-      bet.expiryTimestampSecs <= nowSec &&
-      !bet.betId
-    );
-    
-    if (betsNeedingId.length > 0) {
-      console.log(`⚠️ ${betsNeedingId.length} bet(s) are ready to settle but need Bet ID. Click "Enter Bet ID & Settle" in the panel.`);
-    }
     
     // Settle one bet at a time (to avoid overwhelming the network)
     if (betsToSettle.length > 0 && !isSettling) {
@@ -236,7 +225,6 @@ export function PriceCanvas() {
       });
     });
   }, [currentBucket]);
-
 
   // Set initial viewport position when price data arrives
   const initializedRef = useRef(false);
@@ -271,13 +259,33 @@ export function PriceCanvas() {
     const height = canvas.height;
     const startTime = priceHistory.length > 0 ? priceHistory[0].timestamp : Date.now();
     const referencePrice = referencePriceRef.current;
+    
+    // Show loading or error state
+    if (isLoading || priceHistory.length === 0) {
+      ctx.fillStyle = '#0a0a0f';
+      ctx.fillRect(0, 0, width, height);
+      ctx.fillStyle = '#666';
+      ctx.font = '16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(isLoading ? 'Loading Pyth price feed...' : 'Initializing...', width / 2, height / 2);
+      return;
+    }
+    
+    if (error) {
+      ctx.fillStyle = '#0a0a0f';
+      ctx.fillRect(0, 0, width, height);
+      ctx.fillStyle = '#ff3232';
+      ctx.font = '16px monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText('Error loading price feed', width / 2, height / 2 - 10);
+      ctx.fillStyle = '#666';
+      ctx.font = '12px monospace';
+      ctx.fillText(error.message, width / 2, height / 2 + 10);
+      return;
+    }
 
-    // Clear canvas with dark gradient background
-    const gradient = ctx.createLinearGradient(0, 0, width, height);
-    gradient.addColorStop(0, '#050816');
-    gradient.addColorStop(0.5, '#0b1020');
-    gradient.addColorStop(1, '#0a0618');
-    ctx.fillStyle = gradient;
+    // Clear canvas
+    ctx.fillStyle = '#0a0a0f';
     ctx.fillRect(0, 0, width, height);
 
     // Apply transformations
@@ -291,37 +299,20 @@ export function PriceCanvas() {
     const visibleTop = -offsetY / scale;
     const visibleBottom = (height - offsetY) / scale;
 
-    // Draw grid with purple tint - increased opacity for visibility
-    ctx.strokeStyle = 'rgba(139, 92, 246, 0.5)';
-    ctx.lineWidth = 2 / scale;
+    // Draw grid
+    ctx.strokeStyle = '#1a1a2e';
+    ctx.lineWidth = 1;
 
-    // Vertical grid lines (time) - align with time buckets
-    if (currentBucket && earliestBettableBucket) {
-      // Calculate which buckets are visible
-      const startBucket = Math.floor((visibleLeft * TIME_PER_GRID / GRID_SIZE + startTime) / (TIME_BUCKET_SECONDS * 1000));
-      const endBucket = Math.ceil((visibleRight * TIME_PER_GRID / GRID_SIZE + startTime) / (TIME_BUCKET_SECONDS * 1000));
-      
-      for (let bucket = startBucket; bucket <= endBucket; bucket++) {
-        const bucketTimestamp = bucket * TIME_BUCKET_SECONDS * 1000;
-        const x = ((bucketTimestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
-        
-        ctx.beginPath();
-        ctx.moveTo(x, visibleTop);
-        ctx.lineTo(x, visibleBottom);
-        ctx.stroke();
-      }
-    } else {
-      // Fallback to regular grid if bucket data not available
-      const startGridX = Math.floor(visibleLeft / GRID_SIZE) * GRID_SIZE;
-      for (let x = startGridX; x < visibleRight; x += GRID_SIZE) {
-        ctx.beginPath();
-        ctx.moveTo(x, visibleTop);
-        ctx.lineTo(x, visibleBottom);
-        ctx.stroke();
-      }
+    // Vertical grid lines (time) - same size as horizontal for square cells
+    const startGridX = Math.floor(visibleLeft / GRID_SIZE) * GRID_SIZE;
+    for (let x = startGridX; x < visibleRight; x += GRID_SIZE) {
+      ctx.beginPath();
+      ctx.moveTo(x, visibleTop);
+      ctx.lineTo(x, visibleBottom);
+      ctx.stroke();
     }
 
-    // Horizontal grid lines (price) - fixed grid
+    // Horizontal grid lines (price)
     const startGridY = Math.floor(visibleTop / GRID_SIZE) * GRID_SIZE;
     for (let y = startGridY; y < visibleBottom; y += GRID_SIZE) {
       ctx.beginPath();
@@ -330,36 +321,20 @@ export function PriceCanvas() {
       ctx.stroke();
     }
 
-    // Draw price labels - adaptive spacing based on zoom
-    const labelSpacing = scale < 0.5 ? GRID_SIZE * 4 : scale < 1 ? GRID_SIZE * 2 : GRID_SIZE;
-    const shouldDrawPriceLabels = scale > 0.2; // Hide labels when too zoomed out
-    
-    if (shouldDrawPriceLabels) {
-      ctx.fillStyle = '#94a3b8';
-      const fontSize = Math.max(10, 12 / scale);
-      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
-      
-      for (let y = startGridY; y < visibleBottom; y += labelSpacing) {
-        const price = referencePrice - (y / GRID_SIZE) * PRICE_PER_GRID;
-        ctx.fillText(`$${price.toFixed(2)}`, visibleLeft + 5 / scale, y - 5 / scale);
-      }
+    // Draw price labels
+    ctx.fillStyle = '#666';
+    ctx.font = '12px monospace';
+    for (let y = startGridY; y < visibleBottom; y += GRID_SIZE) {
+      const price = referencePrice - (y / GRID_SIZE) * PRICE_PER_GRID;
+      ctx.fillText(`$${price.toFixed(2)}`, visibleLeft + 5, y - 5);
     }
 
-    // Draw time labels - adaptive spacing based on zoom
-    const timeSpacing = scale < 0.5 ? GRID_SIZE * 40 : scale < 1 ? GRID_SIZE * 20 : GRID_SIZE * 10;
-    const shouldDrawTimeLabels = scale > 0.2; // Hide labels when too zoomed out
-    
-    if (shouldDrawTimeLabels) {
-      const fontSize = Math.max(10, 12 / scale);
-      ctx.font = `${fontSize}px Inter, system-ui, sans-serif`;
-      
-      const startGridX = Math.floor(visibleLeft / GRID_SIZE) * GRID_SIZE;
-      for (let x = startGridX; x < visibleRight; x += timeSpacing) {
-        const timeOffset = (x / GRID_SIZE) * TIME_PER_GRID;
-        const date = new Date(startTime + timeOffset);
-        const timeStr = date.toLocaleTimeString();
-        ctx.fillText(timeStr, x + 5 / scale, visibleBottom - 10 / scale);
-      }
+    // Draw time labels (every 10 grid cells)
+    for (let x = startGridX; x < visibleRight; x += GRID_SIZE * 10) {
+      const timeOffset = (x / GRID_SIZE) * TIME_PER_GRID;
+      const date = new Date(startTime + timeOffset);
+      const timeStr = date.toLocaleTimeString();
+      ctx.fillText(timeStr, x + 5, visibleBottom - 10);
     }
 
     // Draw betting grid ahead of current price
@@ -370,13 +345,11 @@ export function PriceCanvas() {
       const currentPriceY = ((referencePrice - currentPriceValue) / PRICE_PER_GRID) * GRID_SIZE;
       
       // Determine which grid row contains the current price
-      // Use Math.floor so the grid cell containing the price is the mid bucket (1.05x)
       const currentPriceGridRow = Math.floor(currentPriceY / GRID_SIZE);
       
       // Current time column is the currentBucket
       const currentTimeColumn = currentBucket;
       
-      // Draw betting cells - include past cells that have bets placed on them
       // Find the earliest column that has a bet to ensure we render all active bets
       const earliestBetColumn = bets.length > 0 
         ? Math.min(...bets.map(b => b.columnIndex), earliestBettableBucket)
@@ -394,8 +367,7 @@ export function PriceCanvas() {
         // Only draw if visible
         if (cellX + GRID_SIZE < visibleLeft || cellX > visibleRight) continue;
         
-        // Draw cells for each price bucket (0 to NUM_PRICE_BUCKETS - 1)
-        // Position them on the fixed grid aligned with current price
+        // Draw cells for each price bucket
         const startRow = Math.floor(visibleTop / GRID_SIZE) - 1;
         const endRow = Math.ceil(visibleBottom / GRID_SIZE) + 1;
         
@@ -403,7 +375,6 @@ export function PriceCanvas() {
           const cellY = gridRow * GRID_SIZE;
           
           // Calculate which price bucket this grid row represents
-          // The row closest to current price is the mid bucket (1.05x)
           const rowOffsetFromCurrentPrice = gridRow - currentPriceGridRow;
           const priceBucket = MID_PRICE_BUCKET - rowOffsetFromCurrentPrice;
           
@@ -433,7 +404,7 @@ export function PriceCanvas() {
           let strokeColor: string;
           const displayMultiplier = bet ? bet.multiplier : multiplier;
           
-          if (bet?.status === 'won') {
+          if (bet?.status === 'won' || bet?.status === 'settled') {
             // Winning cell - bright green
             bgColor = 'rgba(34, 197, 94, 0.50)';
             textColor = '#22c55e';
@@ -448,33 +419,23 @@ export function PriceCanvas() {
             bgColor = 'rgba(59, 130, 246, 0.30)';
             textColor = '#3b82f6';
             strokeColor = 'rgba(59, 130, 246, 0.80)';
-          } else if (bet?.status === 'settled') {
-            // Settled - light blue
-            bgColor = 'rgba(59, 130, 246, 0.20)';
-            textColor = '#60a5fa';
-            strokeColor = 'rgba(59, 130, 246, 0.50)';
           } else if (bet?.status === 'placed') {
             // Placed bet - cyan
             bgColor = 'rgba(6, 182, 212, 0.30)';
             textColor = '#06b6d4';
             strokeColor = 'rgba(6, 182, 212, 0.80)';
-          } else if (bet?.status === 'error') {
-            // Error - red
+          } else if (bet?.status === 'error' || bet?.status === 'lost') {
+            // Error/Lost - red
             bgColor = 'rgba(239, 68, 68, 0.30)';
             textColor = '#ef4444';
             strokeColor = 'rgba(239, 68, 68, 0.80)';
-          } else if (bet?.status === 'lost') {
-            // Lost bet - dimmed red
-            bgColor = 'rgba(239, 68, 68, 0.15)';
-            textColor = '#ef4444';
-            strokeColor = 'rgba(239, 68, 68, 0.40)';
           } else if (col < currentTimeColumn && !bet) {
             // Past cells without bets - dimmed
             bgColor = 'rgba(71, 85, 105, 0.10)';
             textColor = '#64748b';
             strokeColor = 'rgba(71, 85, 105, 0.15)';
           } else {
-            // Available cells - emerald with varying intensity based on distance from mid bucket
+            // Available cells - emerald with varying intensity
             const distanceFromMid = Math.abs(priceBucket - MID_PRICE_BUCKET);
             const opacity = Math.min(0.15 + distanceFromMid * 0.02, 0.25);
             bgColor = `rgba(16, 185, 129, ${opacity})`;
@@ -491,24 +452,14 @@ export function PriceCanvas() {
           ctx.lineWidth = (bet?.status === 'won' || bet?.status === 'placed' ? 2 : 1) / scale;
           ctx.strokeRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
           
-          // Draw glow effect and star icon if bet was won
-          if (bet?.status === 'won') {
+          // Draw glow effect if bet was won
+          if (bet?.status === 'won' || bet?.status === 'settled') {
             const glowIntensity = 0.2 + 0.15 * Math.sin(Date.now() / 300);
             ctx.shadowColor = '#22c55e';
             ctx.shadowBlur = 15 / scale;
             ctx.fillStyle = `rgba(34, 197, 94, ${glowIntensity})`;
             ctx.fillRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
             ctx.shadowBlur = 0;
-            
-            // Draw star icon - only if visible enough
-            if (scale > 0.4) {
-              ctx.fillStyle = '#22c55e';
-              const starSize = Math.max(12, 16 / scale);
-              ctx.font = `${starSize}px sans-serif`;
-              ctx.textAlign = 'right';
-              ctx.textBaseline = 'top';
-              ctx.fillText('★', cellX + GRID_SIZE - 5 / scale, cellY + 5 / scale);
-            }
           }
           
           // Draw multiplier text - only if zoomed in enough
@@ -534,21 +485,11 @@ export function PriceCanvas() {
       ctx.textBaseline = 'alphabetic';
     }
 
-    // Draw price line with gradient
+    // Draw price line
     if (priceHistory.length > 1 && currentPrice) {
-      const lineGradient = ctx.createLinearGradient(
-        ((priceHistory[0].timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE,
-        0,
-        ((priceHistory[priceHistory.length - 1].timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE,
-        0
-      );
-      lineGradient.addColorStop(0, 'rgba(236, 72, 153, 0.3)');
-      lineGradient.addColorStop(0.5, 'rgba(168, 85, 247, 0.8)');
-      lineGradient.addColorStop(1, 'rgba(99, 102, 241, 0.3)');
-      
       ctx.beginPath();
-      ctx.strokeStyle = lineGradient;
-      ctx.lineWidth = 3 / scale;
+      ctx.strokeStyle = '#00ff88';
+      ctx.lineWidth = 2 / scale;
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
@@ -566,44 +507,44 @@ export function PriceCanvas() {
       }
       ctx.stroke();
 
-      // Draw glow effect with purple tint
-      ctx.strokeStyle = 'rgba(168, 85, 247, 0.3)';
+      // Draw glow effect
+      ctx.strokeStyle = 'rgba(0, 255, 136, 0.3)';
       ctx.lineWidth = 6 / scale;
       ctx.stroke();
 
-      // Draw current price indicator (emerald)
+      // Draw current price indicator
       const latestX = ((currentPrice.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
       const latestY = ((referencePrice - currentPrice.price) / PRICE_PER_GRID) * GRID_SIZE;
 
       // Pulsing dot
       ctx.beginPath();
       ctx.arc(latestX, latestY, 6 / scale, 0, Math.PI * 2);
-      ctx.fillStyle = '#10b981';
+      ctx.fillStyle = '#00ff88';
       ctx.fill();
 
       ctx.beginPath();
       ctx.arc(latestX, latestY, 10 / scale, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(16, 185, 129, 0.5)';
+      ctx.strokeStyle = 'rgba(0, 255, 136, 0.5)';
       ctx.lineWidth = 2 / scale;
       ctx.stroke();
 
-      // Current price label - scale aware
+      // Current price label
       const fontSize = Math.max(10, Math.min(16, 14 / scale));
-      ctx.fillStyle = '#10b981';
+      ctx.fillStyle = '#00ff88';
       ctx.font = `bold ${fontSize}px Inter, system-ui, monospace`;
       const labelOffset = Math.max(15, 20 / scale);
       ctx.fillText(`$${currentPrice.price.toFixed(2)}`, latestX + labelOffset, latestY + 5 / scale);
     }
 
     ctx.restore();
-  }, [canvasState, priceHistory, currentPrice, bets, currentBucket, earliestBettableBucket]);
+  }, [canvasState, priceHistory, currentPrice, bets, currentBucket, earliestBettableBucket, isLoading, error]);
 
-  // Draw on canvas whenever state changes
+  // Draw on canvas
   useEffect(() => {
     draw();
   }, [draw]);
 
-  // Handle canvas resize and initial setup
+  // Handle canvas resize
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -611,49 +552,13 @@ export function PriceCanvas() {
     const resizeCanvas = () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
-      
       draw();
     };
 
-    // Initial resize
     resizeCanvas();
-    
     window.addEventListener('resize', resizeCanvas);
     return () => window.removeEventListener('resize', resizeCanvas);
   }, [draw]);
-
-  // Handle wheel event for zooming (using ref to add non-passive listener)
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const handleWheel = (e: WheelEvent) => {
-      e.preventDefault();
-      const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
-
-      const rect = canvas.getBoundingClientRect();
-      const mouseX = e.clientX - rect.left;
-      const mouseY = e.clientY - rect.top;
-
-      setCanvasState((prev) => {
-        const newScale = Math.max(0.1, Math.min(5, prev.scale * zoomFactor));
-        
-        // Zoom towards mouse position
-        const scaleChange = newScale / prev.scale;
-        const newOffsetX = mouseX - (mouseX - prev.offsetX) * scaleChange;
-        const newOffsetY = mouseY - (mouseY - prev.offsetY) * scaleChange;
-
-        return {
-          offsetX: newOffsetX,
-          offsetY: newOffsetY,
-          scale: newScale,
-        };
-      });
-    };
-
-    canvas.addEventListener('wheel', handleWheel, { passive: false });
-    return () => canvas.removeEventListener('wheel', handleWheel);
-  }, []);
 
   // Mouse event handlers for panning
   const handleMouseDown = (e: React.MouseEvent) => {
@@ -804,9 +709,9 @@ export function PriceCanvas() {
       ));
       
       if (result.betId) {
-        console.log(`✅ Bet placed with ID: ${result.betId}`);
+        console.log(`\u2705 Bet placed with ID: ${result.betId}`);
       } else {
-        console.warn('⚠️ Bet placed but ID not extracted - will need manual entry for settlement');
+        console.warn('\u26a0\ufe0f Bet placed but ID not extracted - will need manual entry for settlement');
       }
     } catch (error: unknown) {
       console.error('Failed to place bet:', error);
@@ -873,9 +778,33 @@ export function PriceCanvas() {
     bet.expiryTimestampSecs && 
     bet.expiryTimestampSecs <= nowSec
   );
-  
-  // Bets that need betId before they can be settled
-  const needingBetId = eligibleForSettlement.filter(bet => !bet.betId);
+
+  // Wheel event for zooming
+  const handleWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const zoomFactor = e.deltaY > 0 ? 0.9 : 1.1;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    setCanvasState((prev) => {
+      const newScale = Math.max(0.1, Math.min(5, prev.scale * zoomFactor));
+      
+      // Zoom towards mouse position
+      const scaleChange = newScale / prev.scale;
+      const newOffsetX = mouseX - (mouseX - prev.offsetX) * scaleChange;
+      const newOffsetY = mouseY - (mouseY - prev.offsetY) * scaleChange;
+
+      return {
+        offsetX: newOffsetX,
+        offsetY: newOffsetY,
+        scale: newScale,
+      };
+    });
+  };
 
   return (
     <>
@@ -886,12 +815,13 @@ export function PriceCanvas() {
           width: '100vw',
           height: '100vh',
           cursor: isDragging ? 'grabbing' : 'grab',
-          backgroundColor: '#050816',
+          backgroundColor: '#0a0a0f',
         }}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseLeave}
+        onWheel={handleWheel}
       />
       <FloatingBetButton
         stakeAmount={stakeAmount}
@@ -917,17 +847,6 @@ export function PriceCanvas() {
                 </button>
               )}
             </div>
-            {/* Debug button to check market state */}
-            <button
-              onClick={async () => {
-                const { getMarketNextBetId } = await import('../lib/aptosClient');
-                const nextBetId = await getMarketNextBetId();
-                alert(`Market next_bet_id: ${nextBetId}\n\nThis means valid bet IDs are 0 to ${nextBetId ? BigInt(nextBetId) - 1n : 'unknown'}`);
-              }}
-              className="w-full px-2 py-1 bg-indigo-600/50 hover:bg-indigo-600/70 rounded text-white text-xs transition-all"
-            >
-              🔍 Check Market State
-            </button>
           </div>
           
           {/* Bet List */}
@@ -1028,9 +947,7 @@ export function PriceCanvas() {
           {/* Footer */}
           <div className="p-3 border-t border-purple-500/30 text-xs text-purple-300 text-center">
             {eligibleForSettlement.length > 0 
-              ? needingBetId.length > 0
-                ? `${eligibleForSettlement.length} bet(s) ready • ${needingBetId.length} need Bet ID`
-                : `${eligibleForSettlement.length} bet(s) ready to settle`
+              ? `${eligibleForSettlement.length} bet(s) ready to settle`
               : 'No bets ready to settle yet'}
           </div>
         </div>

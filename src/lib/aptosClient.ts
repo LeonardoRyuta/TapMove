@@ -44,7 +44,34 @@ export function buildPlaceBetPayload(
 }
 
 /**
- * Build the payload for settle_bet_public transaction
+ * Build the payload for settle_bet_public_no_pyth transaction (MVP version)
+ * 
+ * This version doesn't require Pyth price updates - the caller provides
+ * the realized bucket directly.
+ * 
+ * @param betId - Unique bet ID (u64)
+ * @param realizedBucket - The price bucket where the price ended up (u8)
+ */
+export function buildSettleBetNoPythPayload(
+  betId: string | number,
+  realizedBucket: number,
+) {
+  return {
+    function: `${MODULE_ADDRESS}::${MODULE_NAME}::settle_bet_public_no_pyth`,
+    typeArguments: [COIN_TYPE],
+    functionArguments: [
+      MARKET_ADMIN_ADDRESS,      // market_admin: address
+      betId.toString(),          // bet_id: u64
+      realizedBucket,            // realized_bucket: u8
+    ],
+  };
+}
+
+/**
+ * Build the payload for settle_bet_public transaction (legacy Pyth version)
+ * 
+ * TODO: This is the old version that requires Pyth price updates on-chain.
+ * Kept for reference but not actively used in MVP.
  * 
  * @param betId - Unique bet ID (u64)
  * @param pythPriceUpdate - Nested array of price update bytes (vector<vector<u8>>)
@@ -116,7 +143,9 @@ export async function extractBetIdFromTransaction(
       for (const change of txn.changes) {
         if (
           change.type === 'write_resource' &&
+          'address' in change &&
           change.address === MARKET_ADMIN_ADDRESS &&
+          'data' in change &&
           typeof change.data === 'object' &&
           change.data !== null &&
           'type' in change.data &&
@@ -124,7 +153,12 @@ export async function extractBetIdFromTransaction(
           change.data.type.includes('::tap_market::Market')
         ) {
           // Found the Market resource change
-          const data = change.data as any;
+          interface MarketResourceData {
+            data: {
+              next_bet_id: string;
+            };
+          }
+          const data = change.data as unknown as MarketResourceData;
           if (data.data && typeof data.data.next_bet_id === 'string') {
             // next_bet_id was incremented, so the bet we just placed is next_bet_id - 1
             const nextBetId = parseInt(data.data.next_bet_id, 10);
@@ -142,10 +176,10 @@ export async function extractBetIdFromTransaction(
         }
       }
       
-      console.log('📋 Available changes in transaction:', txn.changes.map((c: any) => ({
+      console.log('📋 Available changes in transaction:', txn.changes.map((c) => ({
         type: c.type,
-        address: c.address,
-        dataType: c.data?.type
+        address: 'address' in c ? c.address : undefined,
+        dataType: 'data' in c && c.data && typeof c.data === 'object' && 'type' in c.data ? c.data.type : undefined
       })));
     }
     
@@ -158,6 +192,22 @@ export async function extractBetIdFromTransaction(
 }
 
 /**
+ * Transaction payload structure
+ */
+export interface TransactionPayload {
+  function: string;
+  typeArguments: string[];
+  functionArguments: (string | number | number[][])[];
+}
+
+/**
+ * Wallet signer interface
+ */
+export interface WalletSigner {
+  signAndSubmitTransaction: (payload: TransactionPayload) => Promise<{ hash: string }>;
+}
+
+/**
  * Submit a transaction using the provided signer
  * 
  * @param signer - Wallet signer with signAndSubmitTransaction method
@@ -165,10 +215,8 @@ export async function extractBetIdFromTransaction(
  * @returns Transaction hash
  */
 export async function submitTransactionWithSigner(
-  signer: {
-    signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;
-  },
-  payload: any,
+  signer: WalletSigner,
+  payload: TransactionPayload,
 ): Promise<string> {
   console.log("Submitting transaction:", payload);
   
@@ -195,7 +243,7 @@ export async function submitTransactionWithSigner(
 /**
  * Parse transaction errors into user-friendly messages
  */
-function parseTransactionError(error: any): Error {
+function parseTransactionError(error: unknown): Error {
   const errorStr = error?.toString() || "";
   
   // Map contract error codes to messages
@@ -323,4 +371,62 @@ export async function verifyBetIdExists(betId: string | number): Promise<boolean
     console.error('Failed to verify bet ID:', error);
     return false;
   }
+}
+
+/**
+ * Convert Move tokens to octas (1 MOVE = 10^8 octas)
+ * 
+ * @param moveAmount - Amount in MOVE tokens
+ * @returns Amount in octas
+ */
+export function moveToOctas(moveAmount: number): bigint {
+  return BigInt(Math.floor(moveAmount * 100_000_000));
+}
+
+/**
+ * Convert octas to Move tokens (1 MOVE = 10^8 octas)
+ * 
+ * @param octas - Amount in octas (as string or number)
+ * @returns Amount in MOVE tokens
+ */
+export function octasToMove(octas: string | number | bigint): number {
+  const octasNum = typeof octas === 'bigint' ? octas : BigInt(octas);
+  return Number(octasNum) / 100_000_000;
+}
+
+/**
+ * Get account balance for a specific coin type
+ * 
+ * @param address - Account address
+ * @param coinType - Coin type (defaults to COIN_TYPE from config)
+ * @returns Balance as string in human-readable format (MOVE tokens)
+ */
+export async function getAccountBalance(
+  address: string,
+  coinType: string = COIN_TYPE
+): Promise<string> {
+  try {
+    const balance = await aptosClient.getAccountCoinAmount({
+      accountAddress: address,
+      coinType: coinType as `${string}::${string}::${string}`,
+    });
+    return octasToMove(balance).toFixed(8);
+  } catch (error) {
+    console.error('Failed to fetch account balance:', error);
+    return '0';
+  }
+}
+
+/**
+ * Format an address for display (show first and last few characters)
+ * 
+ * @param address - Full address
+ * @param chars - Number of characters to show on each end (default: 6)
+ * @returns Formatted address like "0x1234...5678"
+ */
+export function formatAddress(address: string, chars: number = 6): string {
+  if (!address || address.length < chars * 2) {
+    return address;
+  }
+  return `${address.slice(0, chars)}...${address.slice(-chars)}`;
 }
