@@ -374,6 +374,96 @@ export async function verifyBetIdExists(betId: string | number): Promise<boolean
 }
 
 /**
+ * Bet settlement result from on-chain event
+ */
+export interface BetSettlementResult {
+  betId: string;
+  user: string;
+  priceBucket: number;
+  realizedBucket: number;
+  won: boolean;
+  stake: string;
+  payout: string;
+}
+
+/**
+ * Extract bet settlement result from a settle_bet transaction
+ * 
+ * Reads the BetSettledEvent emitted by the contract to determine:
+ * - Whether the bet won or lost
+ * - The payout amount (if won)
+ * - The realized price bucket vs predicted bucket
+ * 
+ * @param txHash - Transaction hash from settle_bet
+ * @returns Settlement result, or null if not found
+ */
+export async function extractBetSettlementFromTransaction(
+  txHash: string,
+): Promise<BetSettlementResult | null> {
+  try {
+    // Wait for transaction to be fully indexed
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    console.log('🔍 Querying transaction for bet settlement result:', txHash);
+    
+    // Query the transaction with retries
+    let txn;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        txn = await aptosClient.getTransactionByHash({
+          transactionHash: txHash,
+        });
+        break;
+      } catch (error) {
+        if (attempt === 2) throw error;
+        console.log(`Retry ${attempt + 1}/3 for settlement extraction...`);
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      }
+    }
+    
+    if (!txn) {
+      console.warn('Transaction not found for settlement extraction');
+      return null;
+    }
+
+    console.log('Transaction data:', JSON.stringify(txn, null, 2));
+
+    // Look for BetSettledEvent in the transaction events
+    if ('events' in txn && Array.isArray(txn.events)) {
+      console.log(`Found ${txn.events.length} events in transaction`);
+      
+      for (const event of txn.events) {
+        console.log('Event type:', event.type);
+        
+        // Match BetSettledEvent
+        // Expected format: "0x<address>::tap_market::BetSettledEvent"
+        if (event.type.includes('BetSettledEvent')) {
+          console.log('✅ Found BetSettledEvent:', event.data);
+          
+          const data = event.data as Record<string, unknown>;
+          
+          return {
+            betId: data.bet_id?.toString() || '0',
+            user: data.user?.toString() || '',
+            priceBucket: Number(data.price_bucket || 0),
+            realizedBucket: Number(data.realized_bucket || 0),
+            won: Boolean(data.won),
+            stake: data.stake?.toString() || '0',
+            payout: data.payout?.toString() || '0',
+          };
+        }
+      }
+    }
+    
+    console.warn('⚠️ Could not find BetSettledEvent in transaction events');
+    return null;
+  } catch (error) {
+    console.error('Error extracting bet settlement from transaction:', error);
+    return null;
+  }
+}
+
+/**
  * Convert Move tokens to octas (1 MOVE = 10^8 octas)
  * 
  * @param moveAmount - Amount in MOVE tokens

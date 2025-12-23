@@ -45,8 +45,19 @@ module tap_market::tap_market {
         multiplier_bps: u64,
     }
 
+    struct BetSettledEvent has drop, store {
+        bet_id: u64,
+        user: address,
+        price_bucket: u8,
+        realized_bucket: u8,
+        won: bool,
+        stake: u64,
+        payout: u64,
+    }
+
     struct BetEvents has key {
         bet_placed_event: event::EventHandle<BetPlacedEvent>,
+        bet_settled_event: event::EventHandle<BetSettledEvent>,
     }
 
     fun ensure_event_store(admin: &signer) {
@@ -56,6 +67,7 @@ module tap_market::tap_market {
             // because event::new_event_handle expects guid::GUID. :contentReference[oaicite:1]{index=1}
             move_to(admin, BetEvents {
                 bet_placed_event: account::new_event_handle<BetPlacedEvent>(admin),
+                bet_settled_event: account::new_event_handle<BetSettledEvent>(admin),
             });
         }
     }
@@ -430,7 +442,7 @@ module tap_market::tap_market {
         admin: &signer,
         bet_id: u64,
         pyth_price_update: vector<vector<u8>>,
-    ) acquires Market {
+    ) acquires Market, BetEvents {
         // Step 1: Check market exists
         let admin_addr = signer::address_of(admin);
         assert!(exists<Market<CoinType>>(admin_addr), error::not_found(E_NO_MARKET));
@@ -493,13 +505,16 @@ module tap_market::tap_market {
         let did_win = realized_bucket == bet_price_bucket;
 
         // Step 10: Pay out if won
-        if (did_win) {
+        let payout = if (did_win) {
             let payout = bet_stake * bet_multiplier_bps / 10_000;
             let house_balance = coin::value(&market.house_vault);
             assert!(house_balance >= payout, error::invalid_state(E_HOUSE_INSUFFICIENT_LIQUIDITY));
 
             let payout_coins = coin::extract(&mut market.house_vault, payout);
             coin::deposit(bet_user, payout_coins);
+            payout
+        } else {
+            0
         };
 
         // Step 11: Now safe to borrow_mut because we're done with immutable borrow
@@ -509,7 +524,22 @@ module tap_market::tap_market {
         bet_ref_mut.settled = true;
         bet_ref_mut.won = did_win;
 
-        // Step 12: Decrement open bets (already has internal guard)
+        // Step 12: Emit BetSettled event
+        let event_store = borrow_global_mut<BetEvents>(admin_addr);
+        event::emit_event(
+            &mut event_store.bet_settled_event,
+            BetSettledEvent {
+                bet_id,
+                user: bet_user,
+                price_bucket: bet_price_bucket,
+                realized_bucket,
+                won: did_win,
+                stake: bet_stake,
+                payout,
+            },
+        );
+
+        // Step 13: Decrement open bets (already has internal guard)
         decrement_open_bets(market, bet_user);
     }
 
@@ -518,7 +548,7 @@ module tap_market::tap_market {
         market_admin: address,
         bet_id: u64,
         pyth_price_update: vector<vector<u8>>,
-    ) acquires Market {
+    ) acquires Market, BetEvents {
         // Step 1: Check market exists
         assert!(exists<Market<CoinType>>(market_admin), error::not_found(E_NO_MARKET));
         
@@ -576,13 +606,16 @@ module tap_market::tap_market {
         let did_win = realized_bucket == bet_price_bucket;
 
         // Step 11: Pay out if won
-        if (did_win) {
+        let payout = if (did_win) {
             let payout = bet_stake * bet_multiplier_bps / 10_000;
             let house_balance = coin::value(&market.house_vault);
             assert!(house_balance >= payout, error::invalid_state(E_HOUSE_INSUFFICIENT_LIQUIDITY));
 
             let payout_coins = coin::extract(&mut market.house_vault, payout);
             coin::deposit(bet_user, payout_coins);
+            payout
+        } else {
+            0
         };
 
         // Step 12: Now safe to borrow_mut because we're done with immutable borrow
@@ -592,7 +625,22 @@ module tap_market::tap_market {
         bet_ref_mut.settled = true;
         bet_ref_mut.won = did_win;
 
-        // Step 13: Decrement open bets (already has internal guard)
+        // Step 13: Emit BetSettled event
+        let event_store = borrow_global_mut<BetEvents>(market_admin);
+        event::emit_event(
+            &mut event_store.bet_settled_event,
+            BetSettledEvent {
+                bet_id,
+                user: bet_user,
+                price_bucket: bet_price_bucket,
+                realized_bucket,
+                won: did_win,
+                stake: bet_stake,
+                payout,
+            },
+        );
+
+        // Step 14: Decrement open bets (already has internal guard)
         decrement_open_bets<CoinType>(market, bet_user);
     }
 
@@ -605,7 +653,7 @@ module tap_market::tap_market {
         market_admin: address,
         bet_id: u64,
         realized_bucket: u8,
-    ) acquires Market {
+    ) acquires Market, BetEvents {
         // 1) Ensure market exists
         assert!(exists<Market<CoinType>>(market_admin), error::not_found(E_NO_MARKET));
         let market = borrow_global_mut<Market<CoinType>>(market_admin);
@@ -639,7 +687,7 @@ module tap_market::tap_market {
         let did_win = realized_bucket == bet_price_bucket;
 
         // 7) Pay out if win
-        if (did_win) {
+        let payout = if (did_win) {
             let payout = bet_stake * bet_multiplier_bps / 10_000;
             let house_balance = coin::value(&market.house_vault);
             assert!(
@@ -649,6 +697,9 @@ module tap_market::tap_market {
 
             let payout_coins = coin::extract(&mut market.house_vault, payout);
             coin::deposit(bet_user, payout_coins);
+            payout
+        } else {
+            0
         };
 
         // 8) Mark bet as settled
@@ -656,7 +707,22 @@ module tap_market::tap_market {
         bet_ref_mut.settled = true;
         bet_ref_mut.won = did_win;
 
-        // 9) Update open bets count (has internal guard)
+        // 9) Emit BetSettled event
+        let event_store = borrow_global_mut<BetEvents>(market_admin);
+        event::emit_event(
+            &mut event_store.bet_settled_event,
+            BetSettledEvent {
+                bet_id,
+                user: bet_user,
+                price_bucket: bet_price_bucket,
+                realized_bucket,
+                won: did_win,
+                stake: bet_stake,
+                payout,
+            },
+        );
+
+        // 10) Update open bets count (has internal guard)
         decrement_open_bets(market, bet_user);
 
         // Note: `caller` is unused logically, but we keep it as signer

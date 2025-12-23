@@ -78,12 +78,24 @@ export function PriceCanvas() {
   
   // State management
   const [bets, setBets] = useState<BetState[]>([]);
-  const [stakeAmount, setStakeAmount] = useState<number>(0.1); // Default 0.1 APT
+  const [showWinNotification, setShowWinNotification] = useState<{ 
+    show: boolean; 
+    won: boolean; 
+    payout: string;
+    betId: string;
+  } | null>(null);
+  const [stakeAmount, setStakeAmount] = useState<number>(0.01); // Default 0.01 APT
+  const [hoveredCell, setHoveredCell] = useState<{ row: number; col: number } | null>(null);
   const [canvasState, setCanvasState] = useState<CanvasState>({
     offsetX: 0,
     offsetY: 0,
     scale: 1,
   });
+
+  // Animation state for smooth transitions
+  const animationRef = useRef<number | null>(null);
+  const targetOffsetRef = useRef({ x: 0, y: 0 });
+  const currentOffsetRef = useRef({ x: 0, y: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [lastMousePos, setLastMousePos] = useState({ x: 0, y: 0 });
   const [dragStartPos, setDragStartPos] = useState({ x: 0, y: 0 });
@@ -97,6 +109,38 @@ export function PriceCanvas() {
       referencePriceRef.current = Math.round(priceHistory[0].price);
     }
   }, [priceHistory]);
+
+  /**
+   * Check if the price has entered a specific price bucket
+   * Returns true if any recent price point fell within the bucket's range
+   */
+  const hasPriceEnteredBucket = useCallback((priceBucket: number, recentPriceCount: number = 20): boolean => {
+    if (!currentPrice || priceHistory.length === 0) return false;
+    
+    // Calculate the price range for this bucket
+    // Each bucket represents a price range based on PRICE_PER_GRID
+    const currentPriceValue = currentPrice.price;
+    
+    // Calculate bucket center price
+    const bucketOffsetFromMid = priceBucket - MID_PRICE_BUCKET;
+    const bucketCenterPrice = currentPriceValue - (bucketOffsetFromMid * PRICE_PER_GRID);
+    
+    // Define bucket range (±PRICE_PER_GRID/2)
+    const bucketMin = bucketCenterPrice - PRICE_PER_GRID / 2;
+    const bucketMax = bucketCenterPrice + PRICE_PER_GRID / 2;
+    
+    // Check recent price history to see if price entered this range
+    const recentPrices = priceHistory.slice(-recentPriceCount);
+    const priceEntered = recentPrices.some(point => 
+      point.price >= bucketMin && point.price <= bucketMax
+    );
+    
+    if (priceEntered) {
+      console.log(`✅ Price entered bucket ${priceBucket}: range [${bucketMin.toFixed(2)}, ${bucketMax.toFixed(2)}]`);
+    }
+    
+    return priceEntered;
+  }, [currentPrice, priceHistory]);
 
   /**
    * Settle a single bet on-chain using no-pyth method
@@ -138,18 +182,37 @@ export function PriceCanvas() {
     
     try {
       // Use no-pyth settlement with current price
-      const txHash = await settleBetNoPyth({
+      const settlementResult = await settleBetNoPyth({
         betId: bet.betId!,  // Non-null assertion - we checked above
         currentPrice: currentPrice.price,
         referencePrice: referencePriceRef.current,
       });
       
-      console.log('Bet settled:', txHash);
+      console.log('Bet settled:', settlementResult);
+      
+      // Show win/loss notification if we have the result
+      if (settlementResult) {
+        const payoutInMove = Number(settlementResult.payout) / 100_000_000; // Convert octas to MOVE
+        setShowWinNotification({
+          show: true,
+          won: settlementResult.won,
+          payout: payoutInMove.toFixed(4),
+          betId: settlementResult.betId,
+        });
+        
+        // Auto-hide notification after 5 seconds
+        setTimeout(() => {
+          setShowWinNotification(null);
+        }, 5000);
+      }
       
       // Update bet status to settled
       setBets(prev => prev.map(b => 
         b.rowIndex === bet.rowIndex && b.columnIndex === bet.columnIndex
-          ? { ...b, status: 'settled', txHash }
+          ? { 
+              ...b, 
+              status: settlementResult?.won ? 'won' : 'lost',
+            }
           : b
       ));
       
@@ -161,6 +224,20 @@ export function PriceCanvas() {
       const errorMessage = error instanceof Error ? error.message : 'Failed to settle bet';
       
       // Check for common error patterns
+      if (errorMessage.includes('E_EXPIRY_TOO_SOON') || errorMessage.includes('0x10006')) {
+        // Bet not expired yet - silently keep in 'placed' status for auto-retry
+        console.log(`⏳ Bet ${bet.betId} not expired yet, will retry later`);
+        
+        // Revert to placed status without showing alert (will auto-retry)
+        setBets(prev => prev.map(b => 
+          b.rowIndex === bet.rowIndex && b.columnIndex === bet.columnIndex
+            ? { ...b, status: 'placed' }
+            : b
+        ));
+        return; // Exit without showing alert
+      }
+      
+      // For other errors, show alerts
       if (errorMessage.includes('0x6507')) {
         alert(
           `Settlement failed: Bet ID ${bet.betId} not found on-chain.\n\n` +
@@ -170,8 +247,14 @@ export function PriceCanvas() {
           `• Transaction: ${bet.txHash}\n\n` +
           `Check the explorer to verify the bet status.`
         );
-      } else if (errorMessage.includes('E_EXPIRY_TOO_SOON')) {
-        alert(`Settlement failed: Bet has not expired yet. Wait until after ${new Date((bet.expiryTimestampSecs || 0) * 1000).toLocaleString()}`);
+      } else if (errorMessage.includes('E_BET_ALREADY_SETTLED') || errorMessage.includes('0x10009')) {
+        // Bet already settled - just log it, don't alert
+        console.log(`✅ Bet ${bet.betId} already settled`);
+        // Remove from active bets or mark as settled
+        setBets(prev => prev.filter(b => 
+          !(b.rowIndex === bet.rowIndex && b.columnIndex === bet.columnIndex)
+        ));
+        return;
       } else {
         alert(`Settlement failed: ${errorMessage}`);
       }
@@ -192,12 +275,14 @@ export function PriceCanvas() {
     
     const nowSec = Math.floor(Date.now() / 1000);
     
-    // Find bets that are placed/won/lost and past their expiry time
+    // Find bets that are placed (not settled), past their expiry time, AND price entered the bucket
+    // Add 5 second buffer to ensure bet is truly expired
     const betsToSettle = bets.filter(bet => 
-      (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+      bet.status === 'placed' && // Only settle bets that haven't been settled yet
       bet.expiryTimestampSecs && 
-      bet.expiryTimestampSecs <= nowSec &&
-      bet.betId // Only settle if we have a bet ID
+      bet.expiryTimestampSecs + 5 <= nowSec && // Add 5 second safety buffer
+      bet.betId && // Only settle if we have a bet ID
+      hasPriceEnteredBucket(bet.rowIndex) // NEW: Only settle if price entered this bucket
     );
     
     // Settle one bet at a time (to avoid overwhelming the network)
@@ -208,7 +293,7 @@ export function PriceCanvas() {
         console.error('Auto-settlement failed:', err);
       });
     }
-  }, [currentBucket, bets, wallet.authenticated, isSettling, handleSettleBet]);
+  }, [currentBucket, bets, wallet.authenticated, isSettling, handleSettleBet, hasPriceEnteredBucket]);
 
   // Clean up old bets periodically
   useEffect(() => {
@@ -237,14 +322,82 @@ export function PriceCanvas() {
       const timeX = ((currentPrice.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
       const priceY = ((referencePriceRef.current - currentPrice.price) / PRICE_PER_GRID) * GRID_SIZE;
 
-      // Center the view on the latest price point
+      // Set target and current for animation
+      targetOffsetRef.current = {
+        x: -timeX + canvas.width / 2 - 100,
+        y: -priceY + canvas.height / 2,
+      };
+      currentOffsetRef.current = { ...targetOffsetRef.current };
+
+      // Set initial position
       setCanvasState((prev) => ({
         ...prev,
-        offsetX: -timeX + canvas.width / 2 - 100,
-        offsetY: -priceY + canvas.height / 2,
+        offsetX: targetOffsetRef.current.x,
+        offsetY: targetOffsetRef.current.y,
       }));
       initializedRef.current = true;
     }
+  }, [priceHistory, currentPrice]);
+
+  // Smooth animation for viewport changes
+  useEffect(() => {
+    if (!initializedRef.current || !currentPrice || priceHistory.length === 0) return;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const startTime = priceHistory[0].timestamp;
+    const timeX = ((currentPrice.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+    const priceY = ((referencePriceRef.current - currentPrice.price) / PRICE_PER_GRID) * GRID_SIZE;
+
+    // Update target position
+    targetOffsetRef.current = {
+      x: -timeX + canvas.width / 2 - 100,
+      y: -priceY + canvas.height / 2,
+    };
+
+    // Animate to target
+    let lastTime = performance.now();
+    
+    const animate = (currentTime: number) => {
+      const deltaTime = currentTime - lastTime;
+      lastTime = currentTime;
+
+      // Smooth interpolation (lerp with easing)
+      const lerpFactor = Math.min(1, (deltaTime / 1000) * 8); // Adjust speed here
+      
+      currentOffsetRef.current.x += (targetOffsetRef.current.x - currentOffsetRef.current.x) * lerpFactor;
+      currentOffsetRef.current.y += (targetOffsetRef.current.y - currentOffsetRef.current.y) * lerpFactor;
+
+      setCanvasState((prev) => ({
+        ...prev,
+        offsetX: currentOffsetRef.current.x,
+        offsetY: currentOffsetRef.current.y,
+      }));
+
+      // Continue animation if not close enough to target
+      const dx = Math.abs(targetOffsetRef.current.x - currentOffsetRef.current.x);
+      const dy = Math.abs(targetOffsetRef.current.y - currentOffsetRef.current.y);
+      
+      if (dx > 0.1 || dy > 0.1) {
+        animationRef.current = requestAnimationFrame(animate);
+      } else {
+        animationRef.current = null;
+      }
+    };
+
+    // Start animation if not already running
+    if (animationRef.current === null) {
+      animationRef.current = requestAnimationFrame(animate);
+    }
+
+    // Cleanup
+    return () => {
+      if (animationRef.current !== null) {
+        cancelAnimationFrame(animationRef.current);
+        animationRef.current = null;
+      }
+    };
   }, [priceHistory, currentPrice]);
 
   const draw = useCallback(() => {
@@ -493,16 +646,37 @@ export function PriceCanvas() {
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
 
-      let started = false;
-      for (const point of priceHistory) {
-        const x = ((point.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
-        const y = ((referencePrice - point.price) / PRICE_PER_GRID) * GRID_SIZE;
+      // Draw smooth bezier curves through price points
+      if (priceHistory.length > 0) {
+        const points = priceHistory.map(point => ({
+          x: ((point.timestamp - startTime) / TIME_PER_GRID) * GRID_SIZE,
+          y: ((referencePrice - point.price) / PRICE_PER_GRID) * GRID_SIZE,
+        }));
 
-        if (!started) {
-          ctx.moveTo(x, y);
-          started = true;
-        } else {
-          ctx.lineTo(x, y);
+        ctx.moveTo(points[0].x, points[0].y);
+
+        if (points.length === 2) {
+          // Just draw a line for 2 points
+          ctx.lineTo(points[1].x, points[1].y);
+        } else if (points.length > 2) {
+          // Use quadratic curves for smooth interpolation
+          for (let i = 0; i < points.length - 1; i++) {
+            const p1 = points[i + 1];
+            
+            if (i === points.length - 2) {
+              // Last segment - draw directly to end point
+              ctx.lineTo(p1.x, p1.y);
+            } else {
+              // Create smooth curve using quadratic bezier
+              const p2 = points[i + 2];
+              const cpX = p1.x;
+              const cpY = p1.y;
+              const endX = (p1.x + p2.x) / 2;
+              const endY = (p1.y + p2.y) / 2;
+              
+              ctx.quadraticCurveTo(cpX, cpY, endX, endY);
+            }
+          }
         }
       }
       ctx.stroke();
@@ -536,8 +710,48 @@ export function PriceCanvas() {
       ctx.fillText(`$${currentPrice.price.toFixed(2)}`, latestX + labelOffset, latestY + 5 / scale);
     }
 
+    // Draw hovered cell highlight
+    if (hoveredCell && currentPrice && currentBucket && earliestBettableBucket) {
+      const { row, col } = hoveredCell;
+      
+      // Use the SAME calculation as the grid cells
+      // Calculate current price position
+      const currentPriceValue = currentPrice.price;
+      const currentPriceY = ((referencePrice - currentPriceValue) / PRICE_PER_GRID) * GRID_SIZE;
+      const currentPriceGridRow = Math.floor(currentPriceY / GRID_SIZE);
+      
+      // Calculate the grid row for this price bucket
+      // row = priceBucket, MID_PRICE_BUCKET - rowOffsetFromCurrentPrice = priceBucket
+      // So: rowOffsetFromCurrentPrice = MID_PRICE_BUCKET - row
+      const rowOffsetFromCurrentPrice = MID_PRICE_BUCKET - row;
+      const gridRow = currentPriceGridRow + rowOffsetFromCurrentPrice;
+      const cellY = gridRow * GRID_SIZE;
+      
+      // Calculate X position (same as grid cells)
+      const bucketTimestamp = col * TIME_BUCKET_SECONDS * 1000;
+      const cellX = ((bucketTimestamp - startTime) / TIME_PER_GRID) * GRID_SIZE;
+      
+      // Draw glowing border
+      ctx.strokeStyle = 'rgba(139, 92, 246, 0.8)'; // Purple glow
+      ctx.lineWidth = 3 / scale;
+      ctx.strokeRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
+      
+      // Draw inner highlight
+      ctx.fillStyle = 'rgba(139, 92, 246, 0.15)';
+      ctx.fillRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
+      
+      // Draw animated glow effect
+      const glowIntensity = 0.3 + 0.2 * Math.sin(Date.now() / 200);
+      ctx.shadowColor = '#8b5cf6';
+      ctx.shadowBlur = 20 / scale;
+      ctx.strokeStyle = `rgba(139, 92, 246, ${glowIntensity})`;
+      ctx.lineWidth = 2 / scale;
+      ctx.strokeRect(cellX, cellY, GRID_SIZE, GRID_SIZE);
+      ctx.shadowBlur = 0;
+    }
+
     ctx.restore();
-  }, [canvasState, priceHistory, currentPrice, bets, currentBucket, earliestBettableBucket, isLoading, error]);
+  }, [canvasState, priceHistory, currentPrice, bets, currentBucket, earliestBettableBucket, isLoading, error, hoveredCell]);
 
   // Draw on canvas
   useEffect(() => {
@@ -568,18 +782,61 @@ export function PriceCanvas() {
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return;
+    const canvas = canvasRef.current;
+    if (!canvas) return;
 
-    const deltaX = e.clientX - lastMousePos.x;
-    const deltaY = e.clientY - lastMousePos.y;
+    if (isDragging) {
+      const deltaX = e.clientX - lastMousePos.x;
+      const deltaY = e.clientY - lastMousePos.y;
 
-    setCanvasState((prev) => ({
-      ...prev,
-      offsetX: prev.offsetX + deltaX,
-      offsetY: prev.offsetY + deltaY,
-    }));
+      setCanvasState((prev) => ({
+        ...prev,
+        offsetX: prev.offsetX + deltaX,
+        offsetY: prev.offsetY + deltaY,
+      }));
 
-    setLastMousePos({ x: e.clientX, y: e.clientY });
+      setLastMousePos({ x: e.clientX, y: e.clientY });
+    } else {
+      // Update hovered cell when not dragging
+      if (priceHistory.length > 0 && currentPrice && currentBucket && earliestBettableBucket) {
+        const rect = canvas.getBoundingClientRect();
+        const mouseX = e.clientX - rect.left;
+        const mouseY = e.clientY - rect.top;
+        
+        const { offsetX, offsetY, scale } = canvasState;
+        
+        // Convert screen coordinates to world coordinates
+        const worldX = (mouseX - offsetX) / scale;
+        const worldY = (mouseY - offsetY) / scale;
+        
+        // Convert worldX to bucket number
+        const clickedTimestamp = (worldX / GRID_SIZE) * TIME_PER_GRID + priceHistory[0].timestamp;
+        const col = Math.floor(clickedTimestamp / (TIME_BUCKET_SECONDS * 1000));
+        
+        // Convert worldY to price bucket
+        const currentPriceValue = currentPrice.price;
+        const currentPriceY = ((referencePriceRef.current - currentPriceValue) / PRICE_PER_GRID) * GRID_SIZE;
+        const midBucketY = currentPriceY;
+        
+        // Calculate which price bucket was hovered
+        const bucketOffsetFromMid = -Math.round((worldY - midBucketY) / GRID_SIZE);
+        const priceBucket = MID_PRICE_BUCKET + bucketOffsetFromMid;
+        
+        // Only show hover if it's a valid, bettable cell
+        if (
+          priceBucket >= 0 && 
+          priceBucket < NUM_PRICE_BUCKETS &&
+          col >= earliestBettableBucket &&
+          !bets.find(b => b.columnIndex === col && b.rowIndex === priceBucket)
+        ) {
+          setHoveredCell({ row: priceBucket, col });
+        } else {
+          setHoveredCell(null);
+        }
+      } else {
+        setHoveredCell(null);
+      }
+    }
   };
 
   const handleMouseUp = (e: React.MouseEvent) => {
@@ -734,6 +991,7 @@ export function PriceCanvas() {
 
   const handleMouseLeave = () => {
     setIsDragging(false);
+    setHoveredCell(null);
   };
   
   /**
@@ -743,11 +1001,13 @@ export function PriceCanvas() {
     const nowSec = Math.floor(Date.now() / 1000);
     console.log('Auto-settling bets at', new Date().toISOString());
     
-    // Find all bets that are placed/won/lost and past their expiry time
+    // Find all bets that are placed (not settled), past their expiry time, AND price entered bucket
+    // Add 5 second buffer to ensure bets are truly expired
     const eligibleBets = bets.filter(bet => 
-      (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+      bet.status === 'placed' && // Only settle bets that haven't been settled yet
       bet.expiryTimestampSecs && 
-      bet.expiryTimestampSecs <= nowSec
+      bet.expiryTimestampSecs + 5 <= nowSec && // Add 5 second safety buffer
+      hasPriceEnteredBucket(bet.rowIndex) // NEW: Only settle if price entered this bucket
     );
     
     if (eligibleBets.length === 0) {
@@ -774,9 +1034,10 @@ export function PriceCanvas() {
   // Calculate eligible bets for settlement
   const nowSec = Math.floor(Date.now() / 1000);
   const eligibleForSettlement = bets.filter(bet => 
-    (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') &&
+    bet.status === 'placed' && // Only include bets that haven't been settled yet
     bet.expiryTimestampSecs && 
-    bet.expiryTimestampSecs <= nowSec
+    bet.expiryTimestampSecs + 5 <= nowSec && // Add 5 second safety buffer
+    hasPriceEnteredBucket(bet.rowIndex) // NEW: Only settle if price entered this bucket
   );
 
   // Wheel event for zooming
@@ -830,6 +1091,32 @@ export function PriceCanvas() {
         maxBet={100}
       />
       
+      {/* Win/Loss Notification */}
+      {showWinNotification && showWinNotification.win && (
+        <div className={`fixed top-20 left-1/2 transform -translate-x-1/2 px-8 py-6 rounded-xl shadow-2xl border-2 backdrop-blur-md transition-all z-50 ${
+          showWinNotification.won 
+            ? 'bg-gradient-to-br from-green-900/95 to-emerald-900/95 border-green-500/50' 
+            : 'bg-gradient-to-br from-red-900/95 to-rose-900/95 border-red-500/50'
+        }`}>
+          <div className="text-center">
+            <div className="text-5xl mb-3">
+              {showWinNotification.won ? '🎉' : '😔'}
+            </div>
+            <div className="text-2xl font-bold text-white mb-2">
+              {showWinNotification.won ? 'YOU WON!' : 'Better Luck Next Time'}
+            </div>
+            {showWinNotification.won && (
+              <div className="text-3xl font-bold text-green-300 mb-2">
+                +{showWinNotification.payout} MOVE
+              </div>
+            )}
+            <div className="text-sm text-gray-300">
+              Bet ID: {showWinNotification.betId}
+            </div>
+          </div>
+        </div>
+      )}
+      
       {/* Bets Panel - Shows active bets with settlement options */}
       {bets.length > 0 && (
         <div className="fixed top-20 right-4 w-80 max-h-[70vh] bg-gradient-to-br from-purple-900/90 to-indigo-900/90 backdrop-blur-md rounded-xl shadow-2xl border border-purple-500/30 overflow-hidden flex flex-col">
@@ -852,7 +1139,7 @@ export function PriceCanvas() {
           {/* Bet List */}
           <div className="overflow-y-auto p-2 space-y-2">
             {bets.map((bet, idx) => {
-              const isEligible = (bet.status === 'placed' || bet.status === 'won' || bet.status === 'lost') && bet.expiryTimestampSecs && bet.expiryTimestampSecs <= nowSec;
+              const isEligible = bet.status === 'placed' && bet.expiryTimestampSecs && bet.expiryTimestampSecs + 5 <= nowSec && hasPriceEnteredBucket(bet.rowIndex);
               const needsBetId = isEligible && !bet.betId;
               
               return (

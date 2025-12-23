@@ -20,7 +20,7 @@ import {
   getFirstBettableBucket,
   COIN_TYPE,
 } from "../config/tapMarket";
-import { aptosClient, buildPlaceBetPayload, buildSettleBetPayload, buildSettleBetNoPythPayload, extractBetIdFromTransaction } from "../lib/aptosClient";
+import { aptosClient, buildPlaceBetPayload, buildSettleBetPayload, buildSettleBetNoPythPayload, extractBetIdFromTransaction, extractBetSettlementFromTransaction, type BetSettlementResult } from "../lib/aptosClient";
 import type { TransactionPayload } from "../lib/aptosClient";
 import { computeMultiplierBps, getExpiryBucket } from "../lib/multipliers";
 import { fetchPythPriceUpdateData } from "../lib/pythHermesClient";
@@ -55,7 +55,7 @@ export interface SettleBetNoPythParams {
 export interface UseTapMarketReturn {
   placeBet: (params: PlaceBetParams) => Promise<PlaceBetResult>;
   settleBet: (params: SettleBetParams) => Promise<string>;
-  settleBetNoPyth: (params: SettleBetNoPythParams) => Promise<string>;
+  settleBetNoPyth: (params: SettleBetNoPythParams) => Promise<BetSettlementResult | null>;
   isPlacing: boolean;
   isSettling: boolean;
   error: string | null;
@@ -422,8 +422,21 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         });
 
         console.log("✅ Bet settled successfully (no-pyth). Transaction hash:", committedTxn.hash);
+        
+        // Extract settlement result from transaction events
+        const settlementResult = await extractBetSettlementFromTransaction(committedTxn.hash);
+        
+        if (settlementResult) {
+          console.log("📊 Settlement result:", {
+            won: settlementResult.won,
+            payout: settlementResult.payout,
+            priceBucket: settlementResult.priceBucket,
+            realizedBucket: settlementResult.realizedBucket,
+          });
+        }
+        
         setError(null);
-        return committedTxn.hash;
+        return settlementResult;
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Failed to settle bet";
         console.error("Error settling bet (no-pyth):", {
