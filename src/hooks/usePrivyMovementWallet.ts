@@ -33,6 +33,7 @@ export interface PrivyMovementWallet {
 
 export interface AptosSigner {
   signAndSubmitTransaction: (payload: any) => Promise<{ hash: string }>;
+  signTransaction?: (transaction: any) => Promise<Uint8Array>;
 }
 
 /**
@@ -46,6 +47,13 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
   const [isCreatingWallet, setIsCreatingWallet] = useState(false);
   const [balance, setBalance] = useState<number | null>(null);
   const addressRef = useRef<string | null>(null);
+  
+  // Store signRawHash in a ref to ensure we always have the latest version
+  const signRawHashRef = useRef(signRawHash);
+  
+  useEffect(() => {
+    signRawHashRef.current = signRawHash;
+  }, [signRawHash]);
 
   // Create Movement wallet on authentication if not exists
   useEffect(() => {
@@ -105,6 +113,16 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
       return { address: null, aptosSigner: null, aptosAccount: null };
     }
 
+    // CRITICAL: Don't create aptosSigner if signRawHash is not available yet
+    if (!signRawHash) {
+      console.log('signRawHash not available yet, waiting...');
+      return { 
+        address: moveWallet.address, 
+        aptosSigner: null, 
+        aptosAccount: null 
+      };
+    }
+
     const walletAddress = moveWallet.address;
     const publicKeyHex = moveWallet.publicKey;
 
@@ -122,8 +140,10 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
       signAndSubmitTransaction: async (payload: any) => {
         console.log('Signing transaction with Privy wallet:', walletAddress);
 
-        if (!signRawHash) {
-          throw new Error('signRawHash not available');
+        // Check if signRawHash is available
+        const currentSignRawHash = signRawHashRef.current;
+        if (!currentSignRawHash) {
+          throw new Error('Wallet proxy not initialized. Please wait a moment and try again.');
         }
 
         // Build the transaction
@@ -140,7 +160,7 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
         const message = generateSigningMessageForTransaction(rawTxn);
 
         // Sign with Privy wallet
-        const { signature: rawSignature } = await signRawHash({
+        const { signature: rawSignature } = await currentSignRawHash({
           address: walletAddress,
           chainType: 'aptos',
           hash: `0x${toHex(message)}`,
@@ -182,6 +202,46 @@ export function usePrivyMovementWallet(): PrivyMovementWallet {
         }
 
         return { hash: committedTxn.hash };
+      },
+
+      signTransaction: async (transaction: any) => {
+        console.log('Signing transaction (without submit) with Privy wallet:', walletAddress);
+        
+        // Check if signRawHash is available
+        const currentSignRawHash = signRawHashRef.current;
+        if (!currentSignRawHash) {
+          throw new Error('Wallet proxy not initialized. Please wait a moment and try again.');
+        }
+        
+        // Generate signing message from the pre-built transaction
+        const message = generateSigningMessageForTransaction(transaction);
+        
+        // Sign with Privy wallet
+        const { signature: rawSignature } = await currentSignRawHash({
+          address: walletAddress,
+          chainType: 'aptos',
+          hash: `0x${toHex(message)}`,
+        });
+        
+        // Clean up public key (remove 0x prefix and any leading bytes)
+        let cleanPublicKey = publicKeyHex.startsWith('0x')
+          ? publicKeyHex.slice(2)
+          : publicKeyHex;
+        
+        // If public key is 66 characters (33 bytes), remove the first byte (00 prefix)
+        if (cleanPublicKey.length === 66) {
+          cleanPublicKey = cleanPublicKey.slice(2);
+        }
+        
+        // Create authenticator
+        const senderAuthenticator = new AccountAuthenticatorEd25519(
+          new Ed25519PublicKey(cleanPublicKey),
+          new Ed25519Signature(
+            rawSignature.startsWith('0x') ? rawSignature.slice(2) : rawSignature
+          )
+        );
+        
+        return senderAuthenticator.bcsToBytes();
       },
     };
 

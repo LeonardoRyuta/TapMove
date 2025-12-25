@@ -7,12 +7,15 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "server": "cd server && npm run dev",
+    "server:install": "cd server && npm install"
   },
   "dependencies": {
     "@aptos-labs/ts-sdk": "^1.39.0",
     "@privy-io/react-auth": "^3.9.0",
     "@pythnetwork/hermes-client": "^2.1.0",
+    "@shinami/clients": "^0.9.8",
     "@tailwindcss/vite": "^4.1.18",
     "lucide-react": "^0.562.0",
     "react": "^19.2.0",

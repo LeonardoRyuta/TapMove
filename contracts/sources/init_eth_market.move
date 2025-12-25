@@ -18,7 +18,7 @@ module tap_market::init_eth_market {
         // ---- bet sizing (in octas of MOVE) ----
         let min_bet_size: u64 = 100_000;       // 0.001 MOVE
         let max_bet_size: u64 = 10_000_000;    // 0.10 MOVE
-        let max_open_bets_per_user: u64 = 20;
+        let max_open_bets_per_user: u64 = 100;
 
         // ---- price → bucket mapping ----
         //

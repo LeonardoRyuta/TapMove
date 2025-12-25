@@ -7,7 +7,7 @@
  * - Integration with wallet provider
  */
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { Account } from "@aptos-labs/ts-sdk";
 import {
   NUM_PRICE_BUCKETS,
@@ -19,15 +19,20 @@ import {
   getCurrentBucket,
   getFirstBettableBucket,
   COIN_TYPE,
+  MARKET_ADMIN_ADDRESS,
+  MODULE_ADDRESS,
+  MODULE_NAME,
 } from "../config/tapMarket";
 import { aptosClient, buildPlaceBetPayload, buildSettleBetPayload, buildSettleBetNoPythPayload, extractBetIdFromTransaction, extractBetSettlementFromTransaction, type BetSettlementResult } from "../lib/aptosClient";
 import type { TransactionPayload } from "../lib/aptosClient";
 import { computeMultiplierBps, getExpiryBucket } from "../lib/multipliers";
 import { fetchPythPriceUpdateData } from "../lib/pythHermesClient";
 import { mapPriceToBucket } from "../config/tapMarket";
+import { sponsorTransaction } from "../lib/sponsorClient";
 
 export interface AptosSigner {
   signAndSubmitTransaction: (payload: TransactionPayload) => Promise<{ hash: string }>;  
+  signTransaction?: (payload: TransactionPayload, withFeePayer?: boolean) => Promise<Uint8Array>;
 }
 
 export interface PlaceBetParams {
@@ -60,6 +65,7 @@ export interface UseTapMarketReturn {
   isSettling: boolean;
   error: string | null;
   clearError: () => void;
+  queueLength: number;
 }
 
 /**
@@ -73,6 +79,42 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
   const [isPlacing, setIsPlacing] = useState(false);
   const [isSettling, setIsSettling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  
+  // Bet queue system for handling multiple rapid bets
+  const betQueueRef = useRef<Array<() => Promise<PlaceBetResult>>>([]);
+  const isProcessingQueueRef = useRef(false);
+  const pendingBetsCountRef = useRef(0);
+
+  // Track the last transaction timestamp to prevent rapid-fire sequence number conflicts
+  const lastTxTimestampRef = useRef<number>(0);
+
+  /**
+   * Process the bet queue sequentially
+   * Each bet waits for the previous one to complete before starting
+   */
+  const processQueue = useCallback(async () => {
+    if (isProcessingQueueRef.current) return;
+    if (betQueueRef.current.length === 0) return;
+    
+    isProcessingQueueRef.current = true;
+    
+    while (betQueueRef.current.length > 0) {
+      const betFn = betQueueRef.current.shift();
+      if (!betFn) continue;
+      
+      try {
+        await betFn();
+        // Small delay between bets to prevent sequence number conflicts
+        // Reduced from 500ms to 200ms since we now return immediately after submission
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } catch (error) {
+        console.error('Bet in queue failed:', error);
+        // Continue processing remaining bets even if one fails
+      }
+    }
+    
+    isProcessingQueueRef.current = false;
+  }, []);
 
   // Extract address string from Account or use directly
   const address = typeof addressOrAccount === 'string' ? addressOrAccount : addressOrAccount?.accountAddress?.toString() || null;
@@ -119,92 +161,168 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         throw new Error(errorMsg);
       }
 
-      setIsPlacing(true);
-      setError(null);
+      // Queue this bet for sequential processing
+      return new Promise<PlaceBetResult>((resolve, reject) => {
+        const betFn = async () => {
+          try {
+            setIsPlacing(true);
+            pendingBetsCountRef.current++;
+            
+            const result = await executePlaceBet({ rowIndex, columnIndex, stakeAmount });
+            resolve(result);
+            return result;
+          } catch (error) {
+            reject(error);
+            throw error;
+          } finally {
+            pendingBetsCountRef.current--;
+            if (pendingBetsCountRef.current === 0) {
+              setIsPlacing(false);
+            }
+          }
+        };
+        
+        betQueueRef.current.push(betFn);
+        processQueue();
+      });
+    },
+    [address, processQueue]
+  );
+  
+  /**
+   * Execute a single bet placement (internal function)
+   */
+  const executePlaceBet = useCallback(
+    async ({ rowIndex, columnIndex, stakeAmount }: PlaceBetParams): Promise<PlaceBetResult> => {
+      if (!address) {
+        throw new Error("Wallet not connected");
+      }
+
+      const stakeAmountNum = BigInt(stakeAmount);
+      
+      // Convert UI coordinates to contract parameters
+      const priceBucket = rowIndex; // Direct mapping: row index = price bucket
+      
+      // Convert column index to expiry timestamp using new config function
+      const expiryTimestampSecs = computeExpiryTimestampSecs(columnIndex);
+
+      // Build the correct payload with all 4 arguments
+      // Args: market_admin, stake_amount, price_bucket, expiry_timestamp_secs
+      const payload = buildPlaceBetPayload(
+        priceBucket,
+        expiryTimestampSecs,
+        stakeAmountNum
+      );
+
+      console.log("Placing bet with params:", {
+        senderAddress: address,
+        priceBucket,
+        expiryTimestampSecs,
+        stakeAmount,
+        stakeAmountNum: stakeAmountNum.toString(),
+        rowIndex,
+        columnIndex,
+        payload,
+      });
+
+      // Check balance before attempting transaction (only for stake amount, not gas)
+      const balance = await aptosClient.getAccountCoinAmount({
+        accountAddress: address,
+        coinType: COIN_TYPE,
+      });
+
+      if (balance < stakeAmountNum) {
+        throw new Error("Insufficient balance to place this bet");
+      }
 
       try {
-        // Convert UI coordinates to contract parameters
-        const priceBucket = rowIndex; // Direct mapping: row index = price bucket
+        // NOTE: We build the transaction on the frontend to get the latest sequence number
+        console.log("🎉 Building sponsored transaction (gasless)...");
+        const transaction = await aptosClient.transaction.build.simple({
+          sender: address,
+          data: {
+            function: `${MODULE_ADDRESS}::${MODULE_NAME}::place_bet` as `${string}::${string}::${string}`,
+            typeArguments: [COIN_TYPE],
+            functionArguments: [
+              MARKET_ADMIN_ADDRESS,
+              stakeAmountNum.toString(),
+              priceBucket,
+              expiryTimestampSecs,
+            ],
+          },
+          withFeePayer: true, // Enable sponsored transaction
+        });
+
+        // Sign the transaction
+        console.log("✍️ Signing transaction with user wallet...");
+        let senderAuthenticator;
         
-        // Convert column index to expiry timestamp using new config function
-        const expiryTimestampSecs = computeExpiryTimestampSecs(columnIndex);
-
-        // Build the correct payload with all 4 arguments
-        // Args: market_admin, stake_amount, price_bucket, expiry_timestamp_secs
-        const payload = buildPlaceBetPayload(
-          priceBucket,
-          expiryTimestampSecs,
-          stakeAmountNum
-        );
-
-        console.log("Placing bet with params:", {
-          senderAddress: address,
-          priceBucket,
-          expiryTimestampSecs,
-          stakeAmount,
-          stakeAmountNum: stakeAmountNum.toString(),
-          rowIndex,
-          columnIndex,
-          payload,
-        });
-
-        // Check balance before attempting transaction
-        const balance = await aptosClient.getAccountCoinAmount({
-          accountAddress: address,
-          coinType: COIN_TYPE,
-        });
-
-        if (balance < stakeAmountNum) {
-          throw new Error("Insufficient balance to place this bet");
-        }
-
-        // Sign and submit using custom signer if provided
-        let committedTxn;
-        if (signer) {
-          // Use Privy's custom signer
-          console.log("Using Privy signer with address:", address);
-          committedTxn = await signer.signAndSubmitTransaction(payload);
-        } else {
-          // Use standard Aptos client signing
-          console.log("Using standard Aptos signing");
-          const transaction = await aptosClient.transaction.build.simple({
-            sender: address,
-            data: {
-              function: payload.function as `${string}::${string}::${string}`,
-              typeArguments: payload.typeArguments,
-              functionArguments: payload.functionArguments,
-            },
-          });
-          
-          committedTxn = await aptosClient.signAndSubmitTransaction({
+        if (signer && signer.signTransaction) {
+          // Use custom signer's signTransaction method (e.g., Privy)
+          // Pass the built transaction object, not the payload
+          const signatureBytes = await signer.signTransaction(transaction);
+          const { AccountAuthenticator, Deserializer } = await import("@aptos-labs/ts-sdk");
+          const deserializer = new Deserializer(new Uint8Array(signatureBytes));
+          senderAuthenticator = AccountAuthenticator.deserialize(deserializer);
+        } else if (addressOrAccount && typeof addressOrAccount !== 'string') {
+          // Use standard Account object signing
+          senderAuthenticator = aptosClient.transaction.sign({
             signer: addressOrAccount as Account,
             transaction,
           });
+        } else {
+          throw new Error("No valid signer available. Please ensure wallet is properly connected.");
         }
 
-        // Wait for transaction
-        await aptosClient.waitForTransaction({
-          transactionHash: committedTxn.hash,
-        });
+        // Send to backend for sponsoring and submission
+        console.log("🚀 Sending to sponsorship server...");
+        const result = await sponsorTransaction(transaction, senderAuthenticator);
+
+        if (!result.success) {
+          throw new Error(result.error || "Failed to sponsor transaction");
+        }
+
+        console.log("✅ Transaction sponsored and submitted!");
+        const committedTxn = { hash: result.txHash! };
+
+        // Update last transaction timestamp for throttling
+        lastTxTimestampRef.current = Date.now();
 
         console.log("Bet placed successfully. Transaction hash:", committedTxn.hash);
         
-        // Extract bet ID from transaction
-        const betId = await extractBetIdFromTransaction(committedTxn.hash);
-        
-        if (betId) {
-          console.log("✅ Bet ID automatically extracted:", betId);
-        } else {
-          console.warn("⚠️ Could not extract bet ID - user will need to enter manually");
-        }
+        // Extract bet ID in background (don't block on this)
+        extractBetIdFromTransaction(committedTxn.hash).then(betId => {
+          if (betId) {
+            console.log("✅ Bet ID automatically extracted:", betId);
+            // TODO: Update the bet in state with the extracted betId
+          } else {
+            console.warn("⚠️ Could not extract bet ID - user will need to enter manually");
+          }
+        }).catch(err => {
+          console.error("Error extracting bet ID:", err);
+        });
         
         setError(null);
+        // Return immediately without waiting for bet ID extraction
         return {
           txHash: committedTxn.hash,
-          betId,
+          betId: null, // Will be extracted in background
         };
       } catch (err) {
         const errorMessage = err instanceof Error ? err.message : "Failed to place bet";
+        
+        // Check if it's a stale sequence number error and suggest retry
+        if (errorMessage.includes("Stale sequenceNumber") || errorMessage.includes("SEQUENCE_NUMBER")) {
+          const retryMessage = "Transaction sequence number conflict. Please wait a moment and try again.";
+          console.error("⚠️ Sequence number error - transaction may have been sent too quickly:", {
+            error: errorMessage,
+            fullError: err,
+            suggestion: "Wait 1-2 seconds before placing another bet",
+          });
+          setError(retryMessage);
+          throw new Error(retryMessage);
+        }
+        
         console.error("Error placing bet:", {
           error: errorMessage,
           fullError: err,
@@ -215,8 +333,6 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         });
         setError(errorMessage);
         throw err;
-      } finally {
-        setIsPlacing(false);
       }
     },
     [address, signer, addressOrAccount]
@@ -280,35 +396,49 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
           payload,
         });
 
-        // Sign and submit using custom signer if provided
-        let committedTxn;
-        if (signer) {
-          // Use Privy's custom signer
-          console.log("Using Privy signer for settlement");
-          committedTxn = await signer.signAndSubmitTransaction(payload);
-          console.log("Settlement transaction submitted with Privy signer:", committedTxn.hash);
-        } else {
-          // Use standard Aptos client signing
-          console.log("Using standard Aptos signing for settlement");
-          const transaction = await aptosClient.transaction.build.simple({
-            sender: address,
-            data: {
-              function: payload.function as `${string}::${string}::${string}`,
-              typeArguments: payload.typeArguments,
-              functionArguments: payload.functionArguments,
-            },
-          });
-          
-          committedTxn = await aptosClient.signAndSubmitTransaction({
+        // Build transaction with sponsored gas (withFeePayer: true)
+        console.log("🎉 Building sponsored settlement transaction (gasless)...");
+        const transaction = await aptosClient.transaction.build.simple({
+          sender: address,
+          data: {
+            function: payload.function as `${string}::${string}::${string}`,
+            typeArguments: payload.typeArguments,
+            functionArguments: payload.functionArguments,
+          },
+          withFeePayer: true, // Enable sponsored transaction
+        });
+
+        // Sign the transaction
+        console.log("✍️ Signing settlement transaction...");
+        let senderAuthenticator;
+        
+        if (signer && signer.signTransaction) {
+          // Use custom signer's signTransaction method (e.g., Privy)
+          // Pass the built transaction object, not the payload
+          const signatureBytes = await signer.signTransaction(transaction);
+          const { AccountAuthenticator, Deserializer } = await import("@aptos-labs/ts-sdk");
+          const deserializer = new Deserializer(new Uint8Array(signatureBytes));
+          senderAuthenticator = AccountAuthenticator.deserialize(deserializer);
+        } else if (addressOrAccount && typeof addressOrAccount !== 'string') {
+          // Use standard Account object signing
+          senderAuthenticator = aptosClient.transaction.sign({
             signer: addressOrAccount as Account,
             transaction,
           });
+        } else {
+          throw new Error("No valid signer available. Please ensure wallet is properly connected.");
         }
 
-        // Wait for transaction
-        await aptosClient.waitForTransaction({
-          transactionHash: committedTxn.hash,
-        });
+        // Send to backend for sponsoring and submission
+        console.log("🚀 Sending settlement to sponsorship server...");
+        const result = await sponsorTransaction(transaction, senderAuthenticator);
+
+        if (!result.success) {
+          throw new Error(result.error || "Failed to sponsor settlement transaction");
+        }
+
+        console.log("✅ Settlement transaction sponsored and submitted!");
+        const committedTxn = { hash: result.txHash! };
 
         console.log("Bet settled successfully. Transaction hash:", committedTxn.hash);
         setError(null);
@@ -340,7 +470,7 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
    * as the price grid display.
    */
   const settleBetNoPyth = useCallback(
-    async ({ betId, currentPrice, referencePrice }: SettleBetNoPythParams): Promise<string> => {
+    async ({ betId, currentPrice, referencePrice }: SettleBetNoPythParams): Promise<BetSettlementResult | null> => {
       // Validate address
       if (!address) {
         const errorMsg = "Wallet not connected";
@@ -369,16 +499,25 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
         
         console.log("✅ Bet ID verified.");
         
-        // Calculate the realized bucket using frontend logic
-        // Use the same mapping as the grid display
-        const refPrice = referencePrice ?? Math.round(currentPrice);
-        const realizedBucket = mapPriceToBucket(currentPrice, currentPrice, refPrice);
+        // Calculate the realized bucket using the EXACT SAME formula as convertPriceToPriceBucket
+        // This MUST match the formula in PriceCanvas to ensure consistency
+        const refPrice = referencePrice ?? Math.ceil(currentPrice / 0.5) * 0.5;
         
-        console.log("📊 Settlement details:", {
+        // Calculate using EXACT same static grid formula as grid drawing
+        const PRICE_PER_GRID = 0.5;
+        const GRID_SIZE = 50;
+        const worldY = ((refPrice - currentPrice) / PRICE_PER_GRID) * GRID_SIZE;
+        const gridRow = Math.floor(worldY / GRID_SIZE); // MUST use Math.floor to match grid drawing
+        const realizedBucket = MID_PRICE_BUCKET - gridRow;
+        
+        console.log("📊 Settlement calculation details:", {
           betId,
           currentPrice,
           referencePrice: refPrice,
+          worldY: worldY.toFixed(2),
+          gridRow,
           realizedBucket,
+          formula: `realizedBucket = MID_PRICE_BUCKET(${MID_PRICE_BUCKET}) - gridRow(${gridRow}) = ${realizedBucket}`,
         });
 
         // Build the settlement payload (no Pyth update needed)
@@ -391,35 +530,49 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
           payload,
         });
 
-        // Sign and submit using custom signer if provided
-        let committedTxn;
-        if (signer) {
-          // Use Privy's custom signer
-          console.log("Using Privy signer for settlement");
-          committedTxn = await signer.signAndSubmitTransaction(payload);
-          console.log("Settlement transaction submitted with Privy signer:", committedTxn.hash);
-        } else {
-          // Use standard Aptos client signing
-          console.log("Using standard Aptos signing for settlement");
-          const transaction = await aptosClient.transaction.build.simple({
-            sender: address,
-            data: {
-              function: payload.function as `${string}::${string}::${string}`,
-              typeArguments: payload.typeArguments,
-              functionArguments: payload.functionArguments,
-            },
-          });
-          
-          committedTxn = await aptosClient.signAndSubmitTransaction({
+        // Build transaction with sponsored gas (withFeePayer: true)
+        console.log("🎉 Building sponsored settlement transaction (gasless, no-pyth)...");
+        const transaction = await aptosClient.transaction.build.simple({
+          sender: address,
+          data: {
+            function: payload.function as `${string}::${string}::${string}`,
+            typeArguments: payload.typeArguments,
+            functionArguments: payload.functionArguments,
+          },
+          withFeePayer: true, // Enable sponsored transaction
+        });
+
+        // Sign the transaction
+        console.log("✍️ Signing settlement transaction...");
+        let senderAuthenticator;
+        
+        if (signer && signer.signTransaction) {
+          // Use custom signer's signTransaction method (e.g., Privy)
+          // Pass the built transaction object, not the payload
+          const signatureBytes = await signer.signTransaction(transaction);
+          const { AccountAuthenticator, Deserializer } = await import("@aptos-labs/ts-sdk");
+          const deserializer = new Deserializer(new Uint8Array(signatureBytes));
+          senderAuthenticator = AccountAuthenticator.deserialize(deserializer);
+        } else if (addressOrAccount && typeof addressOrAccount !== 'string') {
+          // Use standard Account object signing
+          senderAuthenticator = aptosClient.transaction.sign({
             signer: addressOrAccount as Account,
             transaction,
           });
+        } else {
+          throw new Error("No valid signer available. Please ensure wallet is properly connected.");
         }
 
-        // Wait for transaction
-        await aptosClient.waitForTransaction({
-          transactionHash: committedTxn.hash,
-        });
+        // Send to backend for sponsoring and submission
+        console.log("🚀 Sending settlement to sponsorship server...");
+        const result = await sponsorTransaction(transaction, senderAuthenticator);
+
+        if (!result.success) {
+          throw new Error(result.error || "Failed to sponsor settlement transaction");
+        }
+
+        console.log("✅ Settlement transaction sponsored and submitted!");
+        const committedTxn = { hash: result.txHash! };
 
         console.log("✅ Bet settled successfully (no-pyth). Transaction hash:", committedTxn.hash);
         
@@ -458,6 +611,9 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
   const clearError = useCallback(() => {
     setError(null);
   }, []);
+  
+  // Expose queue length for UI feedback
+  const queueLength = betQueueRef.current.length;
 
   return {
     placeBet,
@@ -467,6 +623,7 @@ export function useTapMarket(addressOrAccount: string | Account | null, signer?:
     isSettling,
     error,
     clearError,
+    queueLength, // Number of bets waiting to be processed
   };
 }
 

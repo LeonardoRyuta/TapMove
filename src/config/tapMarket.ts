@@ -6,9 +6,9 @@
 export const MOVEMENT_NODE_URL = "https://testnet.movementnetwork.xyz/v1";
 
 // Contract deployment addresses
-export const MODULE_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x38cf169f63d3a1ff56834ee5b72060e562abf2a10aed65e03680a30d5f745acb";
+export const MODULE_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x3c26602ff3dcf7ba3c5cba4180a32e5ed821f3f549f58156eaeb280c53b86615";
 export const MODULE_NAME = "tap_market";
-export const MARKET_ADMIN_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x38cf169f63d3a1ff56834ee5b72060e562abf2a10aed65e03680a30d5f745acb";
+export const MARKET_ADMIN_ADDRESS = import.meta.env.VITE_MODULE_ADDRESS || "0x3c26602ff3dcf7ba3c5cba4180a32e5ed821f3f549f58156eaeb280c53b86615";
 export const COIN_TYPE = "0x1::aptos_coin::AptosCoin";
 
 // Grid configuration

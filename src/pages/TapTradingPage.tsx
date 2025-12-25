@@ -20,7 +20,7 @@ export function TapTradingPage() {
               <span className="text-white font-bold text-4xl">T</span>
             </div>
           </div>
-          <h1 className="text-4xl font-bold text-white mb-4">Tap Trading</h1>
+          <h1 className="text-4xl font-bold text-white mb-4">TapMove</h1>
           <p className="text-purple-300 mb-8 text-lg">
             Predict future price movements. Win big with multipliers.
           </p>

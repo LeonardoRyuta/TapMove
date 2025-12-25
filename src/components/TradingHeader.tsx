@@ -36,7 +36,7 @@ export function TradingHeader({
               <span className="text-white font-bold text-xl">T</span>
             </div>
             <div>
-              <h1 className="text-xl font-bold text-white">Tap Trading</h1>
+              <h1 className="text-xl font-bold text-white">TapMove</h1>
               <p className="text-xs text-purple-400">Movement Testnet</p>
             </div>
           </div>
