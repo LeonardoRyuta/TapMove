@@ -277,20 +277,6 @@ npm run build
 
 The built files will be in the `dist` directory, ready for deployment to any static hosting service.
 
-## Contributing
-
-Contributions are welcome. Please follow these guidelines:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes with clear commit messages
-4. Test thoroughly on Movement testnet
-5. Submit a pull request with a detailed description
-
-## License
-
-This project is part of the Movement L1 ecosystem and is provided as-is for educational and experimental purposes.
-
 ## Acknowledgments
 
 - **Movement Labs** for the high-performance L1 blockchain
@@ -298,10 +284,6 @@ This project is part of the Movement L1 ecosystem and is provided as-is for educ
 - **Shinami** for gas station infrastructure
 - **Privy** for seamless wallet authentication
 - **Aptos Labs** for the Move language and SDK
-
-## Contact
-
-For questions, issues, or suggestions, please open an issue on GitHub or reach out through the Movement community channels.
 
 ## Quick Start
 
